@@ -2,12 +2,10 @@
 Standalone tool for comparing EfficientViT backbone implementations.
 This helps verify that ConvMAE wrappers maintain full compatibility.
 """
-
 import torch
 import torch.nn as nn
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
-
 
 class BackboneComparator:
     """
@@ -17,12 +15,12 @@ class BackboneComparator:
     def __init__(self, name: str = "Backbone Comparison"):
         self.name = name
         self.results = {}
-        
+    
     def compare_all(
-        self, 
-        backbone1, 
-        backbone2, 
-        name1: str = "Original", 
+        self,
+        backbone1,
+        backbone2,
+        name1: str = "Original",
         name2: str = "Modified",
         test_input: Optional[torch.Tensor] = None
     ) -> Dict[str, Any]:
@@ -31,11 +29,11 @@ class BackboneComparator:
         
         Args:
             backbone1: First backbone to compare
-            backbone2: Second backbone to compare  
+            backbone2: Second backbone to compare
             name1: Name for first backbone
             name2: Name for second backbone
             test_input: Input tensor for testing (default: random 224x224)
-            
+        
         Returns:
             Dictionary with detailed comparison results
         """
@@ -45,7 +43,7 @@ class BackboneComparator:
         
         if test_input is None:
             test_input = torch.randn(1, 3, 224, 224)
-            
+        
         # Extract actual backbones if wrapped
         actual_backbone1 = self._extract_backbone(backbone1)
         actual_backbone2 = self._extract_backbone(backbone2)
@@ -53,14 +51,15 @@ class BackboneComparator:
         results = {
             'basic_info': self._compare_basic_info(actual_backbone1, actual_backbone2, name1, name2),
             'module_structure': self._compare_module_structure(actual_backbone1, actual_backbone2, name1, name2),
+            'detailed_modules': self._compare_modules_detailed(actual_backbone1, actual_backbone2, name1, name2),
             'parameters': self._compare_parameters(actual_backbone1, actual_backbone2, name1, name2),
             'forward_pass': self._compare_forward_pass(actual_backbone1, actual_backbone2, test_input, name1, name2),
+            'module_forward_passes': self._test_module_forward_passes(actual_backbone1, actual_backbone2, test_input, name1, name2),
             'state_dict': self._compare_state_dicts(actual_backbone1, actual_backbone2, name1, name2)
         }
         
         # Generate summary
         results['summary'] = self._generate_summary(results)
-        
         self.results = results
         return results
     
@@ -70,45 +69,40 @@ class BackboneComparator:
             return backbone.backbone
         return backbone
     
-    def print_all_modules(self, backbone, name: str = "Backbone"):
-        """Print all modules in the backbone."""
-        print(f"\n📋 ALL MODULES IN {name.upper()}")
-        print("=" * 80)
-        
+    def get_module_stats(self, backbone, name: str = "Backbone"):
+        """Get module statistics without printing details."""
+        print(f"\n📋 MODULE STATISTICS FOR {name.upper()}")
+        print("=" * 50)
         modules = dict(backbone.named_modules())
         
-        for i, (module_name, module) in enumerate(modules.items(), 1):
+        # Count by type
+        type_counts = {}
+        total_params = 0
+        
+        for module_name, module in modules.items():
             module_type = type(module).__name__
-            module_class = type(module).__module__
+            type_counts[module_type] = type_counts.get(module_type, 0) + 1
             
             # Get parameter count for this specific module (not children)
             direct_params = sum(p.numel() for p in module.parameters(recurse=False))
-            
-            if module_name == "":
-                module_name = "<root>"
-            
-            print(f"{i:4d}. {module_name}")
-            print(f"      Type: {module_type}")
-            print(f"      Module: {module_class}")
-            print(f"      Direct params: {direct_params:,}")
-            
-            # Show some key attributes if they exist
-            attrs_to_show = ['in_channels', 'out_channels', 'kernel_size', 'stride', 'padding', 
-                           'width_list', 'depth_list', 'num_features', 'eps', 'momentum']
-            
-            attrs_found = []
-            for attr in attrs_to_show:
-                if hasattr(module, attr):
-                    value = getattr(module, attr)
-                    attrs_found.append(f"{attr}={value}")
-            
-            if attrs_found:
-                print(f"      Attributes: {', '.join(attrs_found)}")
-            
-            print()
+            total_params += direct_params
         
         print(f"Total modules: {len(modules)}")
-        print("=" * 80)
+        print(f"Total parameters: {total_params:,}")
+        print(f"Module types: {len(type_counts)}")
+        
+        # Show top module types
+        sorted_types = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)
+        print("\nTop module types:")
+        for module_type, count in sorted_types[:10]:
+            print(f"  {module_type}: {count}")
+        
+        print("=" * 50)
+        return {
+            'total_modules': len(modules),
+            'total_parameters': total_params,
+            'module_types': type_counts
+        }
     
     def _compare_basic_info(self, backbone1, backbone2, name1: str, name2: str) -> Dict[str, Any]:
         """Compare basic information about the backbones."""
@@ -156,7 +150,7 @@ class BackboneComparator:
     
     def _compare_module_structure(self, backbone1, backbone2, name1: str, name2: str) -> Dict[str, Any]:
         """Compare module structure between backbones."""
-        print(f"\n🏗️  MODULE STRUCTURE")
+        print(f"\n🏗️ MODULE STRUCTURE")
         print("-" * 50)
         
         modules1 = dict(backbone1.named_modules())
@@ -164,15 +158,14 @@ class BackboneComparator:
         
         names1 = set(modules1.keys())
         names2 = set(modules2.keys())
-        
         common = names1 & names2
         only_1 = names1 - names2
         only_2 = names2 - names1
         
-        print(f"Total modules:     {name1}: {len(modules1)}, {name2}: {len(modules2)}")
-        print(f"Common modules:    {len(common)}")
-        print(f"Only in {name1}:    {len(only_1)}")
-        print(f"Only in {name2}:    {len(only_2)}")
+        print(f"Total modules: {name1}: {len(modules1)}, {name2}: {len(modules2)}")
+        print(f"Common modules: {len(common)}")
+        print(f"Only in {name1}: {len(only_1)}")
+        print(f"Only in {name2}: {len(only_2)}")
         
         # Check type matches for common modules
         type_matches = 0
@@ -188,29 +181,17 @@ class BackboneComparator:
                     'type2': type(modules2[name]).__name__
                 })
         
-        print(f"Type matches:      {type_matches}/{len(common)}")
+        print(f"Type matches: {type_matches}/{len(common)}")
         
-        # Print detailed differences if any
+        # Print summary of differences without individual module names
         if only_1:
-            print(f"\n❌ Only in {name1}:")
-            for name in sorted(list(only_1)[:10]):  # Limit to first 10
-                print(f"  - {name} ({type(modules1[name]).__name__})")
-            if len(only_1) > 10:
-                print(f"  ... and {len(only_1) - 10} more")
+            print(f"\n❌ {len(only_1)} modules only in {name1}")
         
         if only_2:
-            print(f"\n➕ Only in {name2}:")
-            for name in sorted(list(only_2)[:10]):  # Limit to first 10
-                print(f"  + {name} ({type(modules2[name]).__name__})")
-            if len(only_2) > 10:
-                print(f"  ... and {len(only_2) - 10} more")
+            print(f"\n➕ {len(only_2)} modules only in {name2}")
         
         if type_mismatches:
-            print(f"\n🔄 Type mismatches:")
-            for mismatch in type_mismatches[:5]:  # Limit to first 5
-                print(f"  {mismatch['name']}: {mismatch['type1']} vs {mismatch['type2']}")
-            if len(type_mismatches) > 5:
-                print(f"  ... and {len(type_mismatches) - 5} more")
+            print(f"\n🔄 {len(type_mismatches)} type mismatches found")
         
         return {
             'modules_count': {name1: len(modules1), name2: len(modules2)},
@@ -220,6 +201,136 @@ class BackboneComparator:
             'type_matches': type_matches,
             'type_mismatches': len(type_mismatches),
             'structure_identical': len(only_1) == 0 and len(only_2) == 0 and len(type_mismatches) == 0
+        }
+    
+    def _compare_modules_detailed(self, backbone1, backbone2, name1: str, name2: str) -> Dict[str, Any]:
+        """Detailed module-by-module compatibility comparison."""
+        print(f"\n🔬 DETAILED MODULE-BY-MODULE COMPARISON")
+        print("-" * 50)
+        
+        modules1 = dict(backbone1.named_modules())
+        modules2 = dict(backbone2.named_modules())
+        
+        common_modules = set(modules1.keys()) & set(modules2.keys())
+        module_compatibility = {}
+        
+        compatible_modules = 0
+        incompatible_modules = 0
+        total_mismatches = 0
+        
+        for module_name in sorted(common_modules):
+            if module_name == "":  # Skip root
+                continue
+                
+            module1 = modules1[module_name]
+            module2 = modules2[module_name]
+            
+            # Compare module attributes
+            compatibility = self._compare_single_module(module1, module2, module_name)
+            module_compatibility[module_name] = compatibility
+            
+            if compatibility['compatible']:
+                compatible_modules += 1
+            else:
+                incompatible_modules += 1
+                total_mismatches += len(compatibility['attribute_mismatches'])
+        
+        print(f"Module Compatibility: {compatible_modules}/{len(common_modules)-1} modules compatible")
+        print(f"Total attribute mismatches: {total_mismatches}")
+        
+        if incompatible_modules > 0:
+            print(f"❌ {incompatible_modules} incompatible modules found")
+        else:
+            print("✅ All modules are compatible")
+        
+        return {
+            'compatible_modules': compatible_modules,
+            'incompatible_modules': incompatible_modules,
+            'total_compared': len(common_modules) - 1,  # Exclude root
+            'total_mismatches': total_mismatches,
+            'module_details': module_compatibility,
+            'overall_compatible': incompatible_modules == 0
+        }
+    
+    def _compare_single_module(self, module1, module2, module_name: str) -> Dict[str, Any]:
+        """Compare two individual modules in detail."""
+        
+        # Key attributes to compare based on module type
+        comparison_attributes = {
+            'Conv2d': ['in_channels', 'out_channels', 'kernel_size', 'stride', 'padding', 'dilation', 'groups', 'bias'],
+            'BatchNorm2d': ['num_features', 'eps', 'momentum', 'affine', 'track_running_stats'],
+            'Linear': ['in_features', 'out_features', 'bias'],
+            'GroupNorm': ['num_groups', 'num_channels', 'eps', 'affine'],
+            'LayerNorm': ['normalized_shape', 'eps', 'elementwise_affine'],
+            'EfficientViTBlock': ['width_list', 'depth_list', 'expand_ratio'],
+            'MBConvBlock': ['in_channels', 'out_channels', 'stride', 'expand_ratio'],
+            'ResidualBlock': ['width_list', 'expand_ratio'],
+        }
+        
+        module_type = type(module1).__name__
+        attrs_to_check = comparison_attributes.get(module_type, [])
+        
+        # Add common attributes that might exist
+        common_attrs = ['in_channels', 'out_channels', 'kernel_size', 'stride', 'padding']
+        for attr in common_attrs:
+            if hasattr(module1, attr) and attr not in attrs_to_check:
+                attrs_to_check.append(attr)
+        
+        type_match = type(module1) == type(module2)
+        attribute_mismatches = []
+        
+        if type_match:
+            for attr in attrs_to_check:
+                if hasattr(module1, attr) and hasattr(module2, attr):
+                    val1 = getattr(module1, attr)
+                    val2 = getattr(module2, attr)
+                    if val1 != val2:
+                        attribute_mismatches.append({
+                            'attribute': attr,
+                            'value1': val1,
+                            'value2': val2
+                        })
+                elif hasattr(module1, attr) != hasattr(module2, attr):
+                    attribute_mismatches.append({
+                        'attribute': attr,
+                        'value1': getattr(module1, attr, 'MISSING'),
+                        'value2': getattr(module2, attr, 'MISSING')
+                    })
+        
+        # Test individual module forward pass (if reasonable size)
+        forward_compatible = True
+        try:
+            if hasattr(module1, 'forward') and module_type in ['Conv2d', 'BatchNorm2d', 'Linear']:
+                # Create appropriate test input
+                test_input = None
+                if module_type == 'Conv2d':
+                    in_channels = getattr(module1, 'in_channels', 3)
+                    test_input = torch.randn(1, in_channels, 32, 32)
+                elif module_type == 'Linear':
+                    in_features = getattr(module1, 'in_features', 128)
+                    test_input = torch.randn(1, in_features)
+                elif module_type == 'BatchNorm2d':
+                    num_features = getattr(module1, 'num_features', 64)
+                    test_input = torch.randn(1, num_features, 16, 16)
+                
+                if test_input is not None:
+                    module1.eval()
+                    module2.eval()
+                    with torch.no_grad():
+                        out1 = module1(test_input)
+                        out2 = module2(test_input)
+                        if not torch.allclose(out1, out2, atol=1e-6):
+                            forward_compatible = False
+        except:
+            forward_compatible = False  # Assume incompatible if test fails
+        
+        compatible = type_match and len(attribute_mismatches) == 0 and forward_compatible
+        
+        return {
+            'type_match': type_match,
+            'attribute_mismatches': attribute_mismatches,
+            'forward_compatible': forward_compatible,
+            'compatible': compatible
         }
     
     def _compare_parameters(self, backbone1, backbone2, name1: str, name2: str) -> Dict[str, Any]:
@@ -232,15 +343,14 @@ class BackboneComparator:
         
         names1 = set(params1.keys())
         names2 = set(params2.keys())
-        
         common = names1 & names2
         only_1 = names1 - names2
         only_2 = names2 - names1
         
-        print(f"Total parameters:  {name1}: {len(params1)}, {name2}: {len(params2)}")
+        print(f"Total parameters: {name1}: {len(params1)}, {name2}: {len(params2)}")
         print(f"Common parameters: {len(common)}")
-        print(f"Only in {name1}:     {len(only_1)}")
-        print(f"Only in {name2}:     {len(only_2)}")
+        print(f"Only in {name1}: {len(only_1)}")
+        print(f"Only in {name2}: {len(only_2)}")
         
         # Check shape matches for common parameters
         shape_matches = 0
@@ -253,7 +363,6 @@ class BackboneComparator:
             # Check shapes
             if param1.shape == param2.shape:
                 shape_matches += 1
-                
                 # Check values (only if shapes match)
                 if torch.allclose(param1, param2, atol=1e-6):
                     value_matches += 1
@@ -264,31 +373,18 @@ class BackboneComparator:
                     'shape2': param2.shape
                 })
         
-        print(f"Shape matches:     {shape_matches}/{len(common)}")
-        print(f"Value matches:     {value_matches}/{len(common)}")
+        print(f"Shape matches: {shape_matches}/{len(common)}")
+        print(f"Value matches: {value_matches}/{len(common)}")
         
-        # Show shape mismatches
+        # Show summary of mismatches without parameter names
         if shape_mismatches:
-            print(f"\n📐 Shape mismatches:")
-            for mismatch in shape_mismatches[:5]:
-                print(f"  {mismatch['name']}: {mismatch['shape1']} vs {mismatch['shape2']}")
-            if len(shape_mismatches) > 5:
-                print(f"  ... and {len(shape_mismatches) - 5} more")
+            print(f"\n📐 {len(shape_mismatches)} shape mismatches found")
         
-        # Show missing parameters
         if only_1:
-            print(f"\n❌ Missing in {name2}:")
-            for name in sorted(list(only_1)[:5]):
-                print(f"  - {name} {params1[name].shape}")
-            if len(only_1) > 5:
-                print(f"  ... and {len(only_1) - 5} more")
+            print(f"\n❌ {len(only_1)} parameters missing in {name2}")
         
         if only_2:
-            print(f"\n➕ Extra in {name2}:")
-            for name in sorted(list(only_2)[:5]):
-                print(f"  + {name} {params2[name].shape}")
-            if len(only_2) > 5:
-                print(f"  ... and {len(only_2) - 5} more")
+            print(f"\n➕ {len(only_2)} extra parameters in {name2}")
         
         return {
             'param_count': {name1: len(params1), name2: len(params2)},
@@ -340,9 +436,9 @@ class BackboneComparator:
         keys1, keys2 = set(output1.keys()), set(output2.keys())
         common_keys = keys1 & keys2
         
-        print(f"Output keys:       {name1}: {sorted(keys1)}")
-        print(f"                   {name2}: {sorted(keys2)}")
-        print(f"Common keys:       {len(common_keys)}")
+        print(f"Output keys: {name1}: {sorted(keys1)}")
+        print(f"             {name2}: {sorted(keys2)}")
+        print(f"Common keys: {len(common_keys)}")
         
         key_match = keys1 == keys2
         shape_matches = 0
@@ -350,7 +446,6 @@ class BackboneComparator:
         
         if key_match:
             print(f"✓ Output keys match")
-            
             for key in common_keys:
                 if torch.is_tensor(output1[key]) and torch.is_tensor(output2[key]):
                     shape_match = output1[key].shape == output2[key].shape
@@ -362,7 +457,7 @@ class BackboneComparator:
                         print(f"  {key:15}: {output1[key].shape} | values_match: {value_match}")
                     else:
                         print(f"  {key:15}: shape mismatch {output1[key].shape} vs {output2[key].shape}")
-                        
+            
             compatible = shape_matches == len(common_keys) and value_matches == len(common_keys)
         else:
             print(f"✗ Output keys don't match")
@@ -380,13 +475,14 @@ class BackboneComparator:
     def _compare_tensor_outputs(self, output1: torch.Tensor, output2: torch.Tensor, name1: str, name2: str) -> Dict[str, Any]:
         """Compare tensor outputs."""
         shape_match = output1.shape == output2.shape
-        print(f"Output shapes:     {name1}: {output1.shape}")
-        print(f"                   {name2}: {output2.shape}")
-        print(f"Shape match:       {shape_match}")
+        
+        print(f"Output shapes: {name1}: {output1.shape}")
+        print(f"               {name2}: {output2.shape}")
+        print(f"Shape match: {shape_match}")
         
         if shape_match:
             value_match = torch.allclose(output1, output2, atol=1e-6)
-            print(f"Value match:       {value_match}")
+            print(f"Value match: {value_match}")
             compatible = value_match
         else:
             compatible = False
@@ -398,6 +494,81 @@ class BackboneComparator:
             'value_match': value_match,
             'compatible': compatible
         }
+    
+    def _test_module_forward_passes(self, backbone1, backbone2, test_input: torch.Tensor, name1: str, name2: str) -> Dict[str, Any]:
+        """Test forward passes of individual modules with hooks."""
+        print(f"\n🧪 MODULE FORWARD PASS TESTING")
+        print("-" * 50)
+        
+        module_outputs1 = {}
+        module_outputs2 = {}
+        
+        # Register forward hooks
+        def create_hook(name, output_dict):
+            def hook(module, input, output):
+                if torch.is_tensor(output):
+                    output_dict[name] = output.clone()
+                elif isinstance(output, (list, tuple)) and len(output) > 0 and torch.is_tensor(output[0]):
+                    output_dict[name] = output[0].clone()
+            return hook
+        
+        hooks1 = []
+        hooks2 = []
+        
+        # Register hooks for common modules
+        modules1 = dict(backbone1.named_modules())
+        modules2 = dict(backbone2.named_modules())
+        common_modules = set(modules1.keys()) & set(modules2.keys())
+        
+        for name in common_modules:
+            if name != "":  # Skip root
+                hook1 = modules1[name].register_forward_hook(create_hook(name, module_outputs1))
+                hook2 = modules2[name].register_forward_hook(create_hook(name, module_outputs2))
+                hooks1.append(hook1)
+                hooks2.append(hook2)
+        
+        try:
+            # Run forward passes
+            backbone1.eval()
+            backbone2.eval()
+            with torch.no_grad():
+                _ = backbone1(test_input)
+                _ = backbone2(test_input)
+            
+            # Compare module outputs
+            compatible_outputs = 0
+            total_outputs = 0
+            incompatible_modules = []
+            
+            for name in common_modules:
+                if name in module_outputs1 and name in module_outputs2:
+                    total_outputs += 1
+                    out1 = module_outputs1[name]
+                    out2 = module_outputs2[name]
+                    
+                    if out1.shape == out2.shape and torch.allclose(out1, out2, atol=1e-6):
+                        compatible_outputs += 1
+                    else:
+                        incompatible_modules.append(name)
+            
+            print(f"Compatible module outputs: {compatible_outputs}/{total_outputs}")
+            
+            if incompatible_modules:
+                print(f"❌ {len(incompatible_modules)} modules with incompatible outputs")
+            else:
+                print("✅ All module outputs compatible")
+            
+            return {
+                'compatible_outputs': compatible_outputs,
+                'total_outputs': total_outputs,
+                'incompatible_modules': len(incompatible_modules),
+                'success': True
+            }
+        
+        finally:
+            # Remove hooks
+            for hook in hooks1 + hooks2:
+                hook.remove()
     
     def _compare_state_dicts(self, backbone1, backbone2, name1: str, name2: str) -> Dict[str, Any]:
         """Compare state dictionaries."""
@@ -411,19 +582,25 @@ class BackboneComparator:
             keys1, keys2 = set(state_dict1.keys()), set(state_dict2.keys())
             common_keys = keys1 & keys2
             
-            print(f"State dict keys:   {name1}: {len(keys1)}, {name2}: {len(keys2)}")
-            print(f"Common keys:       {len(common_keys)}")
+            print(f"State dict keys: {name1}: {len(keys1)}, {name2}: {len(keys2)}")
+            print(f"Common keys: {len(common_keys)}")
             
             # Test loading state dict (using a more generic approach)
+            loadable = True
+            missing_count = 0
+            unexpected_count = 0
+            
             try:
                 # Try to create a test backbone - this might fail if imports aren't available
                 from efficientvit.models.efficientvit.backbone import efficientvit_backbone_b2
                 test_backbone = efficientvit_backbone_b2()
                 missing, unexpected = test_backbone.load_state_dict(state_dict2, strict=False)
-                print(f"Load test:         missing: {len(missing)}, unexpected: {len(unexpected)}")
-                loadable = len(missing) == 0
+                missing_count = len(missing)
+                unexpected_count = len(unexpected)
+                print(f"Load test: missing: {missing_count}, unexpected: {unexpected_count}")
+                loadable = missing_count == 0
             except ImportError:
-                print("Load test:         Skipped (efficientvit not available)")
+                print("Load test: Skipped (efficientvit not available)")
                 loadable = keys1 == keys2  # Fallback check
             
             return {
@@ -433,8 +610,8 @@ class BackboneComparator:
                 'missing_keys': len(keys1 - keys2),
                 'extra_keys': len(keys2 - keys1),
                 'loadable': loadable,
-                'load_missing': len(missing) if 'missing' in locals() else 0,
-                'load_unexpected': len(unexpected) if 'unexpected' in locals() else 0
+                'load_missing': missing_count,
+                'load_unexpected': unexpected_count
             }
             
         except Exception as e:
@@ -467,6 +644,14 @@ class BackboneComparator:
             checks.append(('Module Structure', False, 'Module structures differ'))
             print("❌ Module structures differ")
         
+        # Detailed module checks
+        if results['detailed_modules']['overall_compatible']:
+            checks.append(('Detailed Modules', True, 'All modules compatible'))
+            print("✅ All modules compatible")
+        else:
+            checks.append(('Detailed Modules', False, 'Module incompatibilities found'))
+            print("❌ Module incompatibilities found")
+        
         # Parameter checks
         if results['parameters']['parameters_identical']:
             checks.append(('Parameters', True, 'Parameters identical'))
@@ -482,6 +667,18 @@ class BackboneComparator:
         else:
             checks.append(('Forward Pass', False, 'Forward passes incompatible'))
             print("❌ Forward passes incompatible")
+        
+        # Module forward pass checks
+        if results['module_forward_passes']['success']:
+            if results['module_forward_passes']['incompatible_modules'] == 0:
+                checks.append(('Module Forward Passes', True, 'All module outputs compatible'))
+                print("✅ All module outputs compatible")
+            else:
+                checks.append(('Module Forward Passes', False, 'Some module outputs incompatible'))
+                print("❌ Some module outputs incompatible")
+        else:
+            checks.append(('Module Forward Passes', False, 'Module forward pass testing failed'))
+            print("❌ Module forward pass testing failed")
         
         # State dict checks
         if results['state_dict']['success'] and results['state_dict']['loadable']:
@@ -528,9 +725,9 @@ class BackboneComparator:
         if not self.results:
             print("No comparison results to save. Run compare_all() first.")
             return
-            
+        
         report = {
-            'timestamp': datetime.now().isoformat(),  # Fixed: use datetime.datetime instead of torch.datetime
+            'timestamp': datetime.now().isoformat(),
             'comparison_name': self.name,
             'results': self.results
         }
@@ -554,20 +751,20 @@ def main():
         return
     
     # Create backbones
-    print("🏗️  Creating backbones...")
+    print("🏗️ Creating backbones...")
     original_backbone = efficientvit_backbone_b2()
     convmae_wrapper = RobustConvMAEWrapper(original_backbone, mask_ratio=0.75)
     
     # Create comparator
     comparator = BackboneComparator("EfficientViT vs ConvMAE Wrapper")
     
-    # Print all modules first
-    comparator.print_all_modules(original_backbone, "Original EfficientViT-B2")
-    comparator.print_all_modules(convmae_wrapper, "ConvMAE Wrapper")
+    # Get module statistics (without printing all module names)
+    comparator.get_module_stats(original_backbone, "Original EfficientViT-B2")
+    comparator.get_module_stats(convmae_wrapper, "ConvMAE Wrapper")
     
     # Run comparison
     results = comparator.compare_all(
-        original_backbone, 
+        original_backbone,
         convmae_wrapper,
         "EfficientViT-B2",
         "ConvMAE Wrapper"
