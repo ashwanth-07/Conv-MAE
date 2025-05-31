@@ -5,7 +5,7 @@ import math
 from typing import Tuple, Dict, Optional, Union
 
 # Import official EfficientViT components
-from efficientvit.models.backbone import EfficientViTBackbone, EfficientViTLargeBackbone
+from efficientvit.models.efficientvit.backbone import EfficientViTBackbone, EfficientViTLargeBackbone
 
 
 class RobustMaskedConvLayer(nn.Module):
@@ -423,7 +423,7 @@ if __name__ == "__main__":
     # Test loading backbone for downstream use
     print("\n3. Testing backbone loading...")
     try:
-        from efficientvit.models.backbone import efficientvit_backbone_b2
+        from efficientvit.models.efficientvit.backbone import efficientvit_backbone_b2
         
         backbone = load_convmae_backbone(
             efficientvit_backbone_b2,
