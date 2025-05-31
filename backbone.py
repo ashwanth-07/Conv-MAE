@@ -77,6 +77,9 @@ class RobustConvMAEWrapper(nn.Module):
     """
     
     def __init__(self, backbone: Union[EfficientViTBackbone, EfficientViTLargeBackbone], mask_ratio: float = 0.75):
+        
+        super().__init__()
+        
         self.backbone = backbone
         self.mask_ratio = mask_ratio
         self.mask_generator = RobustBlockMaskGenerator(mask_ratio)
