@@ -5,6 +5,7 @@ This helps verify that ConvMAE wrappers maintain full compatibility.
 
 import torch
 import torch.nn as nn
+from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
 
 
@@ -68,6 +69,46 @@ class BackboneComparator:
         if hasattr(backbone, 'backbone'):
             return backbone.backbone
         return backbone
+    
+    def print_all_modules(self, backbone, name: str = "Backbone"):
+        """Print all modules in the backbone."""
+        print(f"\n📋 ALL MODULES IN {name.upper()}")
+        print("=" * 80)
+        
+        modules = dict(backbone.named_modules())
+        
+        for i, (module_name, module) in enumerate(modules.items(), 1):
+            module_type = type(module).__name__
+            module_class = type(module).__module__
+            
+            # Get parameter count for this specific module (not children)
+            direct_params = sum(p.numel() for p in module.parameters(recurse=False))
+            
+            if module_name == "":
+                module_name = "<root>"
+            
+            print(f"{i:4d}. {module_name}")
+            print(f"      Type: {module_type}")
+            print(f"      Module: {module_class}")
+            print(f"      Direct params: {direct_params:,}")
+            
+            # Show some key attributes if they exist
+            attrs_to_show = ['in_channels', 'out_channels', 'kernel_size', 'stride', 'padding', 
+                           'width_list', 'depth_list', 'num_features', 'eps', 'momentum']
+            
+            attrs_found = []
+            for attr in attrs_to_show:
+                if hasattr(module, attr):
+                    value = getattr(module, attr)
+                    attrs_found.append(f"{attr}={value}")
+            
+            if attrs_found:
+                print(f"      Attributes: {', '.join(attrs_found)}")
+            
+            print()
+        
+        print(f"Total modules: {len(modules)}")
+        print("=" * 80)
     
     def _compare_basic_info(self, backbone1, backbone2, name1: str, name2: str) -> Dict[str, Any]:
         """Compare basic information about the backbones."""
@@ -373,15 +414,17 @@ class BackboneComparator:
             print(f"State dict keys:   {name1}: {len(keys1)}, {name2}: {len(keys2)}")
             print(f"Common keys:       {len(common_keys)}")
             
-            # Test loading state dict
-            from efficientvit.models.efficientvit.backbone import efficientvit_backbone_b2
-            test_backbone = efficientvit_backbone_b2()
-            
-            missing, unexpected = test_backbone.load_state_dict(state_dict2, strict=False)
-            
-            print(f"Load test:         missing: {len(missing)}, unexpected: {len(unexpected)}")
-            
-            loadable = len(missing) == 0
+            # Test loading state dict (using a more generic approach)
+            try:
+                # Try to create a test backbone - this might fail if imports aren't available
+                from efficientvit.models.efficientvit.backbone import efficientvit_backbone_b2
+                test_backbone = efficientvit_backbone_b2()
+                missing, unexpected = test_backbone.load_state_dict(state_dict2, strict=False)
+                print(f"Load test:         missing: {len(missing)}, unexpected: {len(unexpected)}")
+                loadable = len(missing) == 0
+            except ImportError:
+                print("Load test:         Skipped (efficientvit not available)")
+                loadable = keys1 == keys2  # Fallback check
             
             return {
                 'success': True,
@@ -390,8 +433,8 @@ class BackboneComparator:
                 'missing_keys': len(keys1 - keys2),
                 'extra_keys': len(keys2 - keys1),
                 'loadable': loadable,
-                'load_missing': len(missing),
-                'load_unexpected': len(unexpected)
+                'load_missing': len(missing) if 'missing' in locals() else 0,
+                'load_unexpected': len(unexpected) if 'unexpected' in locals() else 0
             }
             
         except Exception as e:
@@ -487,7 +530,7 @@ class BackboneComparator:
             return
             
         report = {
-            'timestamp': torch.datetime.now().isoformat(),
+            'timestamp': datetime.now().isoformat(),  # Fixed: use datetime.datetime instead of torch.datetime
             'comparison_name': self.name,
             'results': self.results
         }
@@ -515,8 +558,14 @@ def main():
     original_backbone = efficientvit_backbone_b2()
     convmae_wrapper = RobustConvMAEWrapper(original_backbone, mask_ratio=0.75)
     
-    # Run comparison
+    # Create comparator
     comparator = BackboneComparator("EfficientViT vs ConvMAE Wrapper")
+    
+    # Print all modules first
+    comparator.print_all_modules(original_backbone, "Original EfficientViT-B2")
+    comparator.print_all_modules(convmae_wrapper, "ConvMAE Wrapper")
+    
+    # Run comparison
     results = comparator.compare_all(
         original_backbone, 
         convmae_wrapper,
