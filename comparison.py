@@ -374,7 +374,7 @@ class BackboneComparator:
             print(f"Common keys:       {len(common_keys)}")
             
             # Test loading state dict
-            from efficientvit.models.backbone import efficientvit_backbone_b2
+            from efficientvit.models.efficientvit.backbone import efficientvit_backbone_b2
             test_backbone = efficientvit_backbone_b2()
             
             missing, unexpected = test_backbone.load_state_dict(state_dict2, strict=False)
