@@ -784,7 +784,7 @@ def main():
     # Import required modules
     try:
         from efficientvit.models.efficientvit.backbone import efficientvit_backbone_b2
-        from backbone import RobustConvMAEWrapper
+        from backbone import ConvMAEEncoder
     except ImportError as e:
         print(f"❌ Import error: {e}")
         print("Make sure EfficientViT and ConvMAE implementations are available.")
@@ -793,7 +793,7 @@ def main():
     # Create backbones
     print("🏗️ Creating backbones...")
     original_backbone = efficientvit_backbone_b2()
-    convmae_wrapper = RobustConvMAEWrapper(original_backbone, mask_ratio=0.75)
+    convmae_wrapper = ConvMAEEncoder(original_backbone, mask_ratio=0.75)
     
     # Create comparator
     comparator = BackboneComparator("EfficientViT vs ConvMAE Wrapper")
