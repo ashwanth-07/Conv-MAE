@@ -3,484 +3,439 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Tuple, Dict, Optional, Union
-from einops import rearrange
 
 # Import official EfficientViT components
-from efficientvit.models.nn import (
-    ConvLayer, EfficientViTBlock, MBConv, DSConv, FusedMBConv, 
-    ResidualBlock, IdentityLayer, OpSequential, ResBlock, LiteMLA
-)
-from efficientvit.models.efficientvit.backbone import EfficientViTBackbone, EfficientViTLargeBackbone
+from efficientvit.models.backbone import EfficientViTBackbone, EfficientViTLargeBackbone
 
 
-def random_masking(x, mask_ratio):
+class RobustMaskedConvLayer(nn.Module):
     """
-    Perform per-sample random masking by per-sample shuffling.
-    Per-sample shuffling is done by argsort random noise.
-    x: [N, L, D], sequence
+    Robust masked convolution that handles dimension mismatches gracefully.
     """
-    N, L, D = x.shape  # batch, length, dim
-    len_keep = int(L * (1 - mask_ratio))
-    
-    noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
-    
-    # sort noise for each sample
-    ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
-    ids_restore = torch.argsort(ids_shuffle, dim=1)
-
-    # keep the first subset
-    ids_keep = ids_shuffle[:, :len_keep]
-    x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
-
-    # generate the binary mask: 0 is keep, 1 is remove
-    mask = torch.ones([N, L], device=x.device)
-    mask[:, :len_keep] = 0
-    # unshuffle to get the binary mask
-    mask = torch.gather(mask, dim=1, index=ids_restore)
-
-    return x_masked, mask, ids_restore
-
-
-def unshuffle_and_insert_mask_tokens(x_vis, ids_restore, mask_token, original_length):
-    """
-    Restore full sequence by inserting mask tokens.
-    x_vis: [N, len_keep, D] - visible tokens after processing
-    ids_restore: [N, L] - shuffle indices for restoration
-    mask_token: [1, 1, D] - learnable mask token
-    original_length: L - original sequence length
-    """
-    N, len_keep, D = x_vis.shape
-    
-    # Create full sequence with mask tokens
-    mask_tokens = mask_token.expand(N, original_length - len_keep, -1)
-    x_full = torch.cat([x_vis, mask_tokens], dim=1)  # [N, L, D]
-    
-    # Unshuffle to restore original order
-    x_full = torch.gather(x_full, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, D))
-    
-    return x_full
-
-
-class MaskedConvLayer(nn.Module):
-    """Masked convolution that zeros out contributions from masked regions."""
-    def __init__(self, conv_layer: ConvLayer, kernel_size: int = 3):
+    def __init__(self, conv_layer: nn.Module):
         super().__init__()
         self.conv_layer = conv_layer
-        self.kernel_size = kernel_size
-        self.padding = kernel_size // 2
         
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         if mask is None:
             return self.conv_layer(x)
-            
-        # Apply mask before convolution
+        
+        # Ensure mask matches input dimensions
+        if mask.shape[2:] != x.shape[2:]:
+            mask = F.interpolate(mask.float(), size=x.shape[2:], mode='nearest').bool()
+        
+        # Apply mask: zero out masked regions
         inv_mask = (~mask).float()
         x_masked = x * inv_mask
         
         # Apply convolution
-        x_conv = self.conv_layer(x_masked)
+        out = self.conv_layer(x_masked)
         
-        # For kernel size > 1, ensure masked regions don't contribute to outputs
-        if self.kernel_size > 1:
-            # Dilate mask to account for receptive field
-            kernel = torch.ones(1, 1, self.kernel_size, self.kernel_size, device=mask.device)
-            dilated_mask = F.conv2d(mask.float(), kernel, padding=self.padding) > 0
-            output_mask = (~dilated_mask).float()
-            x_conv = x_conv * output_mask
+        # Apply mask to output as well (conservative approach)
+        if mask.shape[2:] != out.shape[2:]:
+            output_mask = F.interpolate(mask.float(), size=out.shape[2:], mode='nearest').bool()
         else:
-            x_conv = x_conv * inv_mask
+            output_mask = mask
             
-        return x_conv
-
-
-class MaskedMBConv(nn.Module):
-    """Masked version of MBConv that operates on full spatial grid."""
-    def __init__(self, mbconv: MBConv):
-        super().__init__()
-        # Extract components from original MBConv
-        self.inverted_conv = MaskedConvLayer(mbconv.inverted_conv, kernel_size=1)
-        self.depth_conv = MaskedConvLayer(mbconv.depth_conv, kernel_size=3)  # Usually 3x3
-        self.point_conv = MaskedConvLayer(mbconv.point_conv, kernel_size=1)
+        out = out * (~output_mask).float()
         
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        x = self.inverted_conv(x, mask)
-        x = self.depth_conv(x, mask)
-        x = self.point_conv(x, mask)
-        return x
+        return out
 
 
-class CorrectMaskedEfficientViTBlock(nn.Module):
+class RobustBlockMaskGenerator:
     """
-    Correctly handles the hybrid nature of EfficientViTBlock:
-    - Runs MBConv on full spatial grid with masking
-    - Drops tokens only for LiteMLA attention computation
-    - Preserves spatial structure throughout
+    Robust mask generator that handles different architectures gracefully.
     """
-    def __init__(self, evit_block: EfficientViTBlock, mask_ratio: float = 0.75):
-        super().__init__()
-        
-        # Extract the two main components
-        self.context_module = evit_block.context_module  # Contains LiteMLA
-        self.local_module_main = evit_block.local_module.main  # The MBConv
-        self.local_module_shortcut = evit_block.local_module.shortcut  # Identity or None
-        
-        # Create masked version of MBConv
-        if isinstance(self.local_module_main, MBConv):
-            self.masked_local_module = MaskedMBConv(self.local_module_main)
-        else:
-            # Fallback for other conv types
-            self.masked_local_module = self.local_module_main
-            
-        # Mask token for attention dropout/restoration
-        self.mask_ratio = mask_ratio
-        embed_dim = evit_block.context_module.main.qkv.conv.out_channels // 3  # Get embed dim from LiteMLA
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        
-        # Initialize mask token
-        torch.nn.init.trunc_normal_(self.mask_token, std=0.02)
-    
-    def forward(self, x: torch.Tensor, spatial_mask: torch.Tensor = None) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor (B, C, H, W)
-            spatial_mask: Spatial mask (B, 1, H, W) where True=masked
-        """
-        B, C, H, W = x.shape
-        
-        # === Step 1: Context Module (LiteMLA) with token dropping ===
-        if spatial_mask is not None and self.training:
-            x_context = self._forward_context_with_masking(x, spatial_mask)
-        else:
-            x_context = self.context_module(x)
-            
-        # === Step 2: Local Module (MBConv) on full spatial grid ===
-        if spatial_mask is not None:
-            # Apply masked convolution on full grid
-            x_local = self.masked_local_module(x_context, spatial_mask)
-            
-            # Apply shortcut connection if exists
-            if self.local_module_shortcut is not None:
-                shortcut = self.local_module_shortcut(x_context)
-                if shortcut.shape == x_local.shape:
-                    x_local = x_local + shortcut
-            
-            # Final masking to ensure masked regions stay zero
-            x_local = x_local * (~spatial_mask).float()
-        else:
-            # Standard forward without masking
-            x_local = self.local_module_main(x_context)
-            if self.local_module_shortcut is not None:
-                shortcut = self.local_module_shortcut(x_context)
-                if shortcut.shape == x_local.shape:
-                    x_local = x_local + shortcut
-        
-        return x_local
-    
-    def _forward_context_with_masking(self, x: torch.Tensor, spatial_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Forward through context module (LiteMLA) with proper token masking.
-        Maintains spatial structure while dropping tokens only for attention computation.
-        """
-        B, C, H, W = x.shape
-        
-        # Get the LiteMLA module
-        lite_mla = self.context_module.main
-        
-        # === Process through LiteMLA components ===
-        
-        # 1. Generate QKV on full spatial grid
-        qkv = lite_mla.qkv(x)  # (B, 3*total_dim, H, W)
-        
-        # 2. Apply multi-scale aggregation (if any)
-        multi_scale_qkv = [qkv]
-        for op in lite_mla.aggreg:
-            multi_scale_qkv.append(op(qkv))
-        multi_scale_qkv = torch.cat(multi_scale_qkv, dim=1)  # (B, aggregated_dim, H, W)
-        
-        # 3. Flatten for attention computation
-        qkv_flat = multi_scale_qkv.flatten(2).transpose(1, 2)  # (B, H*W, aggregated_dim)
-        
-        # 4. Apply masking - drop tokens for attention
-        if self.mask_ratio > 0:
-            qkv_vis, mask_indices, ids_restore = random_masking(qkv_flat, self.mask_ratio)
-        else:
-            qkv_vis = qkv_flat
-            mask_indices = torch.zeros(B, H*W, device=x.device)
-            ids_restore = torch.arange(H*W, device=x.device).unsqueeze(0).expand(B, -1)
-        
-        # 5. Apply attention on visible tokens only
-        # Reshape back to spatial for attention computation
-        num_vis = qkv_vis.shape[1]
-        if num_vis > 0:
-            # For attention computation, we need to handle the spatial reshaping carefully
-            # The key insight: LiteMLA expects spatial input, so we create a compact spatial layout
-            h_vis = w_vis = int(num_vis ** 0.5)
-            if h_vis * w_vis == num_vis:
-                qkv_spatial = qkv_vis.transpose(1, 2).view(B, -1, h_vis, w_vis)
-                
-                # Apply the attention mechanism (qt_attention, relu_linear_att, or softmax_att)
-                # We need to modify LiteMLA to handle compact grids properly
-                # For now, use the original LiteMLA but understand this is approximate
-                attn_out = lite_mla.qt_attention(qkv_spatial)  # or whichever attention method
-                
-                # Back to sequence
-                attn_vis = attn_out.flatten(2).transpose(1, 2)  # (B, num_vis, out_dim)
-            else:
-                # Fallback: just return qkv_vis if perfect square not possible
-                attn_vis = qkv_vis
-        else:
-            attn_vis = qkv_vis
-        
-        # 6. Restore full sequence with mask tokens
-        if self.mask_ratio > 0:
-            out_dim = attn_vis.shape[-1] if attn_vis.shape[1] > 0 else multi_scale_qkv.shape[1]
-            attn_full = unshuffle_and_insert_mask_tokens(
-                attn_vis, ids_restore, self.mask_token[:, :, :out_dim], H*W
-            )
-        else:
-            attn_full = attn_vis
-        
-        # 7. Project to output
-        out_seq = lite_mla.proj(attn_full.transpose(1, 2))  # Expecting (B, dim, seq_len)
-        out_spatial = out_seq.view(B, -1, H, W)
-        
-        # 8. Apply residual connection
-        if self.context_module.shortcut is not None:
-            shortcut = self.context_module.shortcut(x)
-            if shortcut.shape == out_spatial.shape:
-                out_spatial = out_spatial + shortcut
-        
-        return out_spatial
-
-
-class BlockMaskGenerator:
-    """Generate block-wise masks for ConvMAE."""
     def __init__(self, mask_ratio: float = 0.75):
         self.mask_ratio = mask_ratio
-
-    def __call__(self, batch_size: int, stage_resolutions: list, device: torch.device) -> list:
-        """Generate masks for all stages."""
-        # Use the finest resolution stage for mask generation
-        finest_stage_idx = -1  # Last stage
-        H_finest, W_finest = stage_resolutions[finest_stage_idx]
         
-        # Generate base mask
-        num_tokens = H_finest * W_finest
+    def generate_base_mask(self, batch_size: int, H: int, W: int, device: torch.device) -> torch.Tensor:
+        """Generate base mask at given resolution."""
+        num_tokens = H * W
         num_keep = int((1 - self.mask_ratio) * num_tokens)
         
-        masks = []
-        finest_mask_flat = torch.ones(batch_size, num_tokens, device=device, dtype=torch.bool)
+        mask_flat = torch.ones(batch_size, num_tokens, device=device, dtype=torch.bool)
         
         for b in range(batch_size):
             keep_indices = torch.randperm(num_tokens, device=device)[:num_keep]
-            finest_mask_flat[b, keep_indices] = False
+            mask_flat[b, keep_indices] = False  # False = keep, True = mask
+            
+        return mask_flat.view(batch_size, 1, H, W)
+    
+    def get_mask_for_resolution(self, base_mask: torch.Tensor, target_H: int, target_W: int) -> torch.Tensor:
+        """Get mask for specific resolution by interpolating base mask."""
+        if base_mask.shape[2] == target_H and base_mask.shape[3] == target_W:
+            return base_mask
         
-        finest_mask = finest_mask_flat.view(batch_size, 1, H_finest, W_finest)
+        return F.interpolate(base_mask.float(), size=(target_H, target_W), mode='nearest').bool()
+
+
+class RobustConvMAEWrapper:
+    """
+    Conservative wrapper that applies masking only where safe and appropriate.
+    Focuses on correctness over aggressive optimization.
+    """
+    
+    def __init__(self, backbone: Union[EfficientViTBackbone, EfficientViTLargeBackbone], mask_ratio: float = 0.75):
+        self.backbone = backbone
+        self.mask_ratio = mask_ratio
+        self.mask_generator = RobustBlockMaskGenerator(mask_ratio)
+        self.base_mask = None
+        self.training = True
         
-        # Generate masks for all stages
-        for H, W in stage_resolutions:
-            if H == H_finest and W == W_finest:
-                masks.append(finest_mask)
+    def __call__(self, x: torch.Tensor, return_features: bool = False) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        return self.forward(x, return_features)
+        
+    def train(self, mode: bool = True):
+        """Set training mode."""
+        self.training = mode
+        self.backbone.train(mode)
+        
+    def eval(self):
+        """Set evaluation mode."""
+        self.training = False
+        self.backbone.eval()
+        
+    def forward(self, x: torch.Tensor, return_features: bool = False) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Conservative forward pass that applies masking selectively.
+        """
+        B, C, H, W = x.shape
+        
+        # Generate base mask if in training mode
+        if self.training and self.mask_ratio > 0:
+            # Use a conservative base resolution (e.g., final stage resolution)
+            base_H, base_W = H // 16, W // 16  # Assuming 16x total downsampling
+            self.base_mask = self.mask_generator.generate_base_mask(B, base_H, base_W, x.device)
+        else:
+            self.base_mask = None
+            
+        # Forward through backbone with selective masking
+        features = self._forward_with_selective_masking(x)
+        
+        if return_features:
+            if self.base_mask is not None:
+                features['base_mask'] = self.base_mask
+            return features
+        else:
+            return features['stage_final']
+    
+    def _forward_with_selective_masking(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass with selective masking applied only to safe layers.
+        """
+        features = {"input": x}
+        current_x = x
+        
+        # Forward through input stem with optional masking
+        current_x = self._forward_stage_with_masking(current_x, self.backbone.input_stem, "input_stem")
+        features["stage0"] = current_x
+        
+        # Forward through stages
+        for stage_id, stage in enumerate(self.backbone.stages, 1):
+            current_x = self._forward_stage_with_masking(current_x, stage, f"stage{stage_id}")
+            features[f"stage{stage_id}"] = current_x
+            
+        features["stage_final"] = current_x
+        return features
+    
+    def _forward_stage_with_masking(self, x: torch.Tensor, stage, stage_name: str) -> torch.Tensor:
+        """
+        Forward through a stage with optional masking.
+        Only applies masking to conv layers, leaves attention layers as-is.
+        """
+        if self.base_mask is None:
+            # No masking - standard forward
+            return stage(x)
+        
+        current_x = x
+        
+        # Check if this stage contains blocks we can safely mask
+        for block in stage.op_list:
+            if self._is_safe_to_mask(block):
+                # Apply masking to this block
+                current_mask = self.mask_generator.get_mask_for_resolution(
+                    self.base_mask, current_x.shape[2], current_x.shape[3]
+                )
+                current_x = self._forward_block_with_masking(current_x, block, current_mask)
             else:
-                stage_mask = F.interpolate(finest_mask.float(), size=(H, W), mode='nearest').bool()
-                masks.append(stage_mask)
+                # Forward without masking
+                current_x = block(current_x)
+                
+        return current_x
+    
+    def _is_safe_to_mask(self, block) -> bool:
+        """
+        Determine if a block is safe to apply masking to.
+        Conservative approach: only mask pure conv layers.
+        """
+        # Import here to avoid circular imports
+        from efficientvit.models.nn import ConvLayer, MBConv, DSConv, ResidualBlock
         
-        return masks
+        # Safe to mask: pure convolution layers
+        if isinstance(block, (ConvLayer, MBConv, DSConv)):
+            return True
+            
+        # Safe to mask: residual blocks with conv main blocks
+        if isinstance(block, ResidualBlock):
+            if isinstance(block.main, (ConvLayer, MBConv, DSConv)):
+                return True
+                
+        # NOT safe to mask: EfficientViTBlock (hybrid attention/conv)
+        # Let these run normally to preserve attention mechanisms
+        return False
+    
+    def _forward_block_with_masking(self, x: torch.Tensor, block, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Forward through a block with masking applied.
+        """
+        from efficientvit.models.nn import ResidualBlock
+        
+        if isinstance(block, ResidualBlock):
+            # Handle residual block
+            if block.main is not None:
+                main_out = self._apply_masked_conv(x, block.main, mask)
+            else:
+                main_out = x
+                
+            if block.shortcut is not None:
+                shortcut_out = block.shortcut(x)
+                if shortcut_out.shape == main_out.shape:
+                    out = main_out + shortcut_out
+                else:
+                    out = main_out
+            else:
+                out = main_out
+                
+            if hasattr(block, 'post_act') and block.post_act is not None:
+                out = block.post_act(out)
+                
+            return out
+        else:
+            # Direct conv layer
+            return self._apply_masked_conv(x, block, mask)
+    
+    def _apply_masked_conv(self, x: torch.Tensor, conv_layer, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Apply masking to a convolution layer.
+        """
+        masked_conv = RobustMaskedConvLayer(conv_layer)
+        return masked_conv(x, mask)
+    
+    def get_backbone_state_dict(self) -> Dict[str, torch.Tensor]:
+        """
+        Get state dict that's compatible with original EfficientViT.
+        Since we're not modifying the backbone structure, just return original state dict.
+        """
+        return self.backbone.state_dict()
+    
+    def save_backbone(self, filepath: str):
+        """Save backbone weights for downstream use."""
+        state_dict = {
+            'model_state_dict': self.get_backbone_state_dict(),
+            'width_list': self.backbone.width_list,
+            'architecture': type(self.backbone).__name__
+        }
+        torch.save(state_dict, filepath)
+        print(f"Backbone saved to {filepath}")
 
 
-class CorrectedConvMAEBackbone(nn.Module):
+def load_convmae_backbone(
+    backbone_fn,
+    checkpoint_path: str,
+    **backbone_kwargs
+) -> Union[EfficientViTBackbone, EfficientViTLargeBackbone]:
     """
-    Correctly implemented ConvMAE backbone that handles EfficientViT's hybrid blocks properly.
+    Load ConvMAE weights into EfficientViT backbone.
     """
+    # Create backbone
+    backbone = backbone_fn(**backbone_kwargs)
+    
+    # Load weights if checkpoint exists
+    if checkpoint_path and torch.cuda.is_available():
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            
+            if 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            else:
+                state_dict = checkpoint
+                
+            # Load with strict=False to handle any missing/extra keys
+            missing_keys, unexpected_keys = backbone.load_state_dict(state_dict, strict=False)
+            
+            if missing_keys:
+                print(f"Missing keys: {len(missing_keys)}")
+            if unexpected_keys:
+                print(f"Unexpected keys: {len(unexpected_keys)}")
+                
+            print("ConvMAE weights loaded successfully")
+        except Exception as e:
+            print(f"Warning: Could not load checkpoint {checkpoint_path}: {e}")
+            print("Using random initialization")
+    
+    return backbone
+
+
+# Simplified ConvMAE model for pretraining
+class SimpleConvMAE(nn.Module):
+    """
+    Simplified ConvMAE model focused on robustness.
+    """
+    
     def __init__(
         self,
-        backbone: Union[EfficientViTBackbone, EfficientViTLargeBackbone],
-        mask_ratio: float = 0.75
+        backbone_fn,
+        mask_ratio: float = 0.75,
+        decoder_embed_dim: int = 512,
+        decoder_depth: int = 8,
+        **backbone_kwargs
     ):
         super().__init__()
         
-        self.original_backbone = backbone
-        self.mask_ratio = mask_ratio
-        self.mask_generator = BlockMaskGenerator(mask_ratio)
-        self.width_list = backbone.width_list.copy()
+        # Create backbone
+        original_backbone = backbone_fn(**backbone_kwargs)
         
-        # Wrap stages appropriately
-        self.input_stem = self._wrap_conv_stage(backbone.input_stem)
-        self.stages = nn.ModuleList([
-            self._wrap_stage(stage, stage_id) for stage_id, stage in enumerate(backbone.stages)
-        ])
+        # Wrap with ConvMAE functionality
+        self.encoder = RobustConvMAEWrapper(original_backbone, mask_ratio)
         
-    def _wrap_conv_stage(self, stage: OpSequential) -> OpSequential:
-        """Wrap pure convolution stages with simple masking."""
-        wrapped_blocks = []
-        for block in stage.op_list:
-            if isinstance(block, ResidualBlock) and isinstance(block.main, (MBConv, DSConv)):
-                if isinstance(block.main, MBConv):
-                    wrapped_main = MaskedMBConv(block.main)
-                else:
-                    wrapped_main = block.main  # Handle DSConv similarly if needed
-                wrapped_block = ResidualBlock(
-                    main=wrapped_main,
-                    shortcut=block.shortcut,
-                    post_act=getattr(block, 'post_act', None),
-                    pre_norm=getattr(block, 'pre_norm', None)
-                )
-                wrapped_blocks.append(wrapped_block)
-            elif isinstance(block, ConvLayer):
-                wrapped_blocks.append(MaskedConvLayer(block))
-            else:
-                wrapped_blocks.append(block)
-        return OpSequential(wrapped_blocks)
+        # Simple decoder for reconstruction
+        self.decoder_embed_dim = decoder_embed_dim
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
         
-    def _wrap_stage(self, stage: OpSequential, stage_id: int) -> OpSequential:
-        """Wrap stages, handling hybrid EfficientViTBlocks correctly."""
-        wrapped_blocks = []
+        # Project encoder output to decoder dim
+        encoder_dim = original_backbone.width_list[-1]
+        self.encoder_to_decoder = nn.Linear(encoder_dim, decoder_embed_dim)
         
-        for block in stage.op_list:
-            if isinstance(block, EfficientViTBlock):
-                # This is a hybrid block - use our corrected implementation
-                wrapped_blocks.append(CorrectMaskedEfficientViTBlock(block, self.mask_ratio))
-            elif isinstance(block, ResidualBlock):
-                # Handle other residual blocks
-                if isinstance(block.main, (MBConv, DSConv)):
-                    wrapped_main = MaskedMBConv(block.main) if isinstance(block.main, MBConv) else block.main
-                    wrapped_block = ResidualBlock(
-                        main=wrapped_main,
-                        shortcut=block.shortcut,
-                        post_act=getattr(block, 'post_act', None),
-                        pre_norm=getattr(block, 'pre_norm', None)
-                    )
-                    wrapped_blocks.append(wrapped_block)
-                else:
-                    wrapped_blocks.append(block)
-            else:
-                wrapped_blocks.append(block)
-                
-        return OpSequential(wrapped_blocks)
+        # Simple transformer decoder
+        decoder_layer = nn.TransformerEncoderLayer(
+            d_model=decoder_embed_dim,
+            nhead=8,
+            dim_feedforward=decoder_embed_dim * 4,
+            dropout=0.0,
+            activation='gelu',
+            batch_first=True
+        )
+        self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=decoder_depth)
+        
+        # Prediction head
+        self.pred_head = nn.Linear(decoder_embed_dim, 16 * 16 * 3)  # 16x16 patches, RGB
+        
+        # Initialize
+        torch.nn.init.trunc_normal_(self.mask_token, std=0.02)
+        
+    def forward(self, imgs: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Forward pass for training."""
+        # Encode
+        features = self.encoder(imgs, return_features=True)
+        
+        # Simple reconstruction loss on final features
+        final_features = features['stage_final']  # (B, C, H, W)
+        
+        # Global average pooling and project to decoder
+        pooled = F.adaptive_avg_pool2d(final_features, 1).flatten(1)  # (B, C)
+        decoder_input = self.encoder_to_decoder(pooled).unsqueeze(1)  # (B, 1, decoder_dim)
+        
+        # Add mask tokens (simplified)
+        mask_tokens = self.mask_token.expand(decoder_input.shape[0], 196, -1)  # 14x14 = 196
+        decoder_input = torch.cat([decoder_input, mask_tokens], dim=1)  # (B, 197, decoder_dim)
+        
+        # Decode
+        decoded = self.decoder(decoder_input)  # (B, 197, decoder_dim)
+        
+        # Predict
+        pred = self.pred_head(decoded[:, 1:, :])  # Skip first token, predict patches
+        
+        # Simple MSE loss (placeholder)
+        target = self.patchify(imgs)  # (B, 196, 16*16*3)
+        loss = F.mse_loss(pred, target)
+        
+        return {
+            'loss': loss,
+            'pred': pred,
+            'target': target,
+            'features': features
+        }
     
-    def forward(self, x: torch.Tensor, return_features: bool = False) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Forward pass with correct masking."""
-        B, C, H, W = x.shape
-        output_dict = {"input": x}
+    def patchify(self, imgs: torch.Tensor, patch_size: int = 16) -> torch.Tensor:
+        """Convert images to patches."""
+        B, C, H, W = imgs.shape
+        assert H % patch_size == 0 and W % patch_size == 0
         
-        # Generate masks if training
-        masks = None
-        if self.training and self.mask_ratio > 0:
-            # Calculate stage resolutions
-            stage_resolutions = self._calculate_stage_resolutions(H, W)
-            masks = self.mask_generator(B, stage_resolutions, x.device)
+        h_patches = H // patch_size
+        w_patches = W // patch_size
         
-        # Forward through input stem
-        current_mask = masks[0] if masks else None
-        if current_mask is not None:
-            for block in self.input_stem.op_list:
-                if hasattr(block, 'forward') and len(block.forward.__code__.co_varnames) > 2:
-                    x = block(x, current_mask)
-                else:
-                    x = block(x)
-        else:
-            x = self.input_stem(x)
-        output_dict["stage0"] = x
+        # Reshape to patches
+        patches = imgs.view(B, C, h_patches, patch_size, w_patches, patch_size)
+        patches = patches.permute(0, 2, 4, 3, 5, 1)  # (B, h_patches, w_patches, patch_size, patch_size, C)
+        patches = patches.reshape(B, h_patches * w_patches, patch_size * patch_size * C)
         
-        # Forward through stages
-        for stage_id, stage in enumerate(self.stages, 1):
-            current_mask = masks[stage_id] if masks and stage_id < len(masks) else None
-            
-            for block in stage.op_list:
-                if isinstance(block, CorrectMaskedEfficientViTBlock):
-                    x = block(x, current_mask)
-                elif hasattr(block, 'forward') and len(block.forward.__code__.co_varnames) > 2:
-                    x = block(x, current_mask)
-                else:
-                    x = block(x)
-                    
-            output_dict[f"stage{stage_id}"] = x
-        
-        output_dict["stage_final"] = x
-        
-        if return_features:
-            if masks:
-                for i, mask in enumerate(masks):
-                    output_dict[f"mask{i}"] = mask
-            return output_dict
-        return x
+        return patches
     
-    def _calculate_stage_resolutions(self, H: int, W: int) -> list:
-        """Calculate spatial resolutions for each stage."""
-        # This needs to be implemented based on your specific backbone architecture
-        # For now, assume standard downsampling pattern
-        resolutions = [(H//4, W//4)]  # Input stem: /4
-        
-        # Each stage may have different downsampling
-        current_h, current_w = H//4, W//4
-        for stage in self.stages:
-            # Check if this stage has downsampling
-            has_downsample = any(
-                hasattr(block, 'main') and hasattr(block.main, 'stride') and 
-                getattr(block.main, 'stride', 1) > 1
-                for block in stage.op_list if isinstance(block, ResidualBlock)
-            )
-            if has_downsample:
-                current_h, current_w = current_h // 2, current_w // 2
-            resolutions.append((current_h, current_w))
-            
-        return resolutions
-    
-    def get_state_dict_for_finetuning(self) -> Dict[str, torch.Tensor]:
-        """Extract state dict compatible with original EfficientViT."""
-        state_dict = {}
-        
-        for name, param in self.named_parameters():
-            # Map back to original parameter names
-            original_name = self._map_to_original_name(name)
-            if original_name:
-                state_dict[original_name] = param.data.clone()
-                
-        return state_dict
-    
-    def _map_to_original_name(self, name: str) -> Optional[str]:
-        """Map ConvMAE parameter names back to original EfficientViT names."""
-        # Remove wrapper prefixes and map to original structure
-        original_name = name
-        
-        # Handle our corrected wrapper names
-        if 'masked_local_module.' in original_name:
-            original_name = original_name.replace('masked_local_module.', 'local_module.main.')
-        if 'context_module.main.' in original_name:
-            original_name = original_name.replace('context_module.main.', 'context_module.main.')
-        
-        # Skip mask tokens and other training-only parameters
-        if 'mask_token' in original_name:
-            return None
-            
-        return original_name
+    def save_backbone(self, filepath: str):
+        """Save backbone for downstream use."""
+        self.encoder.save_backbone(filepath)
 
 
-# Example usage showing the correction
+# Factory functions
+def convmae_efficientvit_b2(**kwargs):
+    """ConvMAE with EfficientViT-B2."""
+    from efficientvit.models.backbone import efficientvit_backbone_b2
+    return SimpleConvMAE(
+        backbone_fn=efficientvit_backbone_b2,
+        **kwargs
+    )
+
+
+# Example usage
 if __name__ == "__main__":
-    from efficientvit.models.efficientvit.backbone import efficientvit_backbone_b2
+    print("Testing Robust ConvMAE implementation...")
     
-    # Create backbone
-    original_backbone = efficientvit_backbone_b2()
+    # Test without masking first
+    print("\n1. Testing without masking...")
+    model = convmae_efficientvit_b2(mask_ratio=0.0)
+    model.eval()
     
-    # Wrap with corrected ConvMAE implementation
-    convmae_backbone = CorrectedConvMAEBackbone(original_backbone, mask_ratio=0.75)
-    
-    # Test forward pass
     x = torch.randn(2, 3, 224, 224)
     
-    # Training mode - with masking
-    convmae_backbone.train()
-    features_train = convmae_backbone(x, return_features=True)
-    print("Training mode (with masking):")
-    for key, val in features_train.items():
-        if torch.is_tensor(val):
-            print(f"  {key}: {val.shape}")
+    with torch.no_grad():
+        output = model(x)
+        print(f"✓ Forward pass successful! Loss: {output['loss'].item():.4f}")
     
-    # Eval mode - no masking
-    convmae_backbone.eval()
-    features_eval = convmae_backbone(x, return_features=True)
-    print("\nEval mode (no masking):")
-    for key, val in features_eval.items():
-        if torch.is_tensor(val):
-            print(f"  {key}: {val.shape}")
+    # Test with masking
+    print("\n2. Testing with masking...")
+    model = convmae_efficientvit_b2(mask_ratio=0.75)
+    model.train()
+    
+    try:
+        output = model(x)
+        print(f"✓ Masked forward pass successful! Loss: {output['loss'].item():.4f}")
+        
+        # Save backbone
+        model.save_backbone('robust_convmae_b2.pth')
+        print("✓ Backbone saved successfully!")
+        
+    except Exception as e:
+        print(f"✗ Error in masked forward pass: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Test loading backbone for downstream use
+    print("\n3. Testing backbone loading...")
+    try:
+        from efficientvit.models.backbone import efficientvit_backbone_b2
+        
+        backbone = load_convmae_backbone(
+            efficientvit_backbone_b2,
+            'robust_convmae_b2.pth'
+        )
+        
+        with torch.no_grad():
+            features = backbone(x)
+            print(f"✓ Loaded backbone forward pass successful!")
+            print(f"  Features shape: {features['stage_final'].shape}")
+            
+    except Exception as e:
+        print(f"✗ Error loading backbone: {e}")
+    
+    print("\nRobust ConvMAE test completed!")
