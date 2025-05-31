@@ -284,7 +284,11 @@ class BackboneComparator:
                 if hasattr(module1, attr) and hasattr(module2, attr):
                     val1 = getattr(module1, attr)
                     val2 = getattr(module2, attr)
-                    if val1 != val2:
+                    
+                    # Handle different types of attribute values
+                    values_match = self._compare_values(val1, val2)
+                    
+                    if not values_match:
                         attribute_mismatches.append({
                             'attribute': attr,
                             'value1': val1,
@@ -332,6 +336,42 @@ class BackboneComparator:
             'forward_compatible': forward_compatible,
             'compatible': compatible
         }
+    
+    def _compare_values(self, val1, val2) -> bool:
+        """Safely compare two values that might be tensors, tuples, lists, or scalars."""
+        try:
+            # Handle None values
+            if val1 is None and val2 is None:
+                return True
+            if val1 is None or val2 is None:
+                return False
+            
+            # Handle tensor values
+            if torch.is_tensor(val1) and torch.is_tensor(val2):
+                if val1.shape != val2.shape:
+                    return False
+                return torch.allclose(val1, val2, atol=1e-6)
+            elif torch.is_tensor(val1) or torch.is_tensor(val2):
+                return False  # One is tensor, one is not
+            
+            # Handle sequence types (tuple, list)
+            if isinstance(val1, (tuple, list)) and isinstance(val2, (tuple, list)):
+                if len(val1) != len(val2):
+                    return False
+                return all(self._compare_values(v1, v2) for v1, v2 in zip(val1, val2))
+            
+            # Handle scalar values
+            if isinstance(val1, (int, float, bool, str)) and isinstance(val2, (int, float, bool, str)):
+                if isinstance(val1, float) and isinstance(val2, float):
+                    return abs(val1 - val2) < 1e-6
+                return val1 == val2
+            
+            # Handle other types by converting to string and comparing
+            return str(val1) == str(val2)
+            
+        except Exception:
+            # If comparison fails, assume they're different
+            return False
     
     def _compare_parameters(self, backbone1, backbone2, name1: str, name2: str) -> Dict[str, Any]:
         """Compare parameters between backbones."""
