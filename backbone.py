@@ -380,7 +380,7 @@ class SimpleConvMAE(nn.Module):
 # Factory functions
 def convmae_efficientvit_b2(**kwargs):
     """ConvMAE with EfficientViT-B2."""
-    from efficientvit.models.backbone import efficientvit_backbone_b2
+    from efficientvit.models.efficientvit.backbone import efficientvit_backbone_b2
     return SimpleConvMAE(
         backbone_fn=efficientvit_backbone_b2,
         **kwargs
