@@ -70,7 +70,7 @@ class RobustBlockMaskGenerator:
         return F.interpolate(base_mask.float(), size=(target_H, target_W), mode='nearest').bool()
 
 
-class RobustConvMAEWrapper:
+class RobustConvMAEWrapper(nn.Module):
     """
     Conservative wrapper that applies masking only where safe and appropriate.
     Focuses on correctness over aggressive optimization.
