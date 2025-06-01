@@ -595,6 +595,7 @@ class EfficientViTBlock(nn.Module):
         self.local_module = ResidualBlock(local_module, IdentityLayer())#,post_norm=nn.BatchNorm2d(in_channels))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        print(f"EffVitBlock: x shape {x.shape}")
         x = self.context_module(x)
         x = self.local_module(x)
         return x # ori or deepnorm_nlp
