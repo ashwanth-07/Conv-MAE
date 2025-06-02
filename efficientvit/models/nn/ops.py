@@ -150,7 +150,11 @@ class LinearLayer(nn.Module):
 class IdentityLayer(nn.Module):
     def forward(self, x: torch.Tensor, valid_mask=None) -> torch.Tensor:
         if valid_mask is not None:
-            return x * valid_mask
+            if valid_mask.shape[2:] != x.shape[2:]:
+                mask = F.interpolate(valid_mask, size=x.shape[2:], mode='nearest')
+            else:
+                mask = valid_mask
+            return x * mask
         else:
             return x
 
