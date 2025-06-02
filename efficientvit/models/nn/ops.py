@@ -385,22 +385,31 @@ class LiteMLA(nn.Module):
             norm=norm[0],
             act_func=act_func[0],
         )
-        self.aggreg = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Conv2d(
-                        3 * total_dim,
-                        3 * total_dim,
-                        scale,
-                        padding=get_same_padding(scale),
-                        groups=3 * total_dim,
-                        bias=use_bias[0],
-                    ),
-                    nn.Conv2d(3 * total_dim, 3 * total_dim, 1, groups=3 * heads, bias=use_bias[0]),
-                )
-                for scale in scales
-            ]
-        )
+        self.aggreg = nn.ModuleList()
+
+        for scale in scales:
+            conv1 = ConvLayer(
+                3 * total_dim,
+                3 * total_dim,
+                kernel_size=scale,
+                stride=1,
+                groups=3 * total_dim,
+                use_bias=use_bias[0],
+                norm=None,
+                act_func=None,
+            ) 
+            conv2 = ConvLayer(
+                3 * total_dim, 
+                3 * total_dim, 
+                kernel_size=1,
+                stride=1,
+                groups=3 * heads, 
+                use_bias=use_bias[0],
+                norm=None,
+                act_func=None,
+            )
+            self.aggreg.append(nn.ModuleList([conv1, conv2]))
+
         self.kernel_func = build_act(kernel_func, inplace=False)
 
         self.proj = ConvLayer(
@@ -417,155 +426,209 @@ class LiteMLA(nn.Module):
         self.ones_scale1 = nn.Parameter(torch.tensor(1.))
         self.positional_encoding = nn.Parameter(torch.zeros(size=(1, heads*dim*2, 224//downsample, 224//downsample)))
     
-    @torch.cuda.amp.autocast(enabled=False)
-    def softmax_att(self, qkv: torch.Tensor) -> torch.Tensor:
-        """
-        Standard scaled-dot-product attention using F.scaled_dot_product_attention,
-        plus the same local depthwise-conv residual as before.
-        """
-        B, C, H, W = qkv.shape
-        N = H * W
-        total_dim = C // 3
-        heads = total_dim // self.dim
-
-        # Reshape & split into q,k,v of shape (B, heads, N, dim)
-        qkv = qkv.view(B, 3, heads, self.dim, N)       # (B,3,heads,dim,N)
-        qkv = qkv.permute(0, 2, 4, 1, 3)                # (B,heads,N,3,dim)
-        q, k, v = qkv[..., 0, :], qkv[..., 1, :], qkv[..., 2, :]
-
-        # Scaled dot-prod attention (gives B×heads×N×dim)
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=None,
-            dropout_p=0.0,
-            scale=self.dim ** -0.5,
-        )
-
-        # Local depthwise-conv residual: reshape v→feature-map, BN+GELU, reshape back
-        fmap = rearrange(v, "b h (h2 w2) c -> (b h) c h2 w2", h2=H, w2=W)
-        fmap = self.act(self.bn(fmap))                  # (B*heads, dim, H, W)
-        fmap = rearrange(fmap, "(b h) c h2 w2 -> b h (h2 w2) c", h=heads)
-        attn_out = attn_out + fmap
-
-        # Reshape back to (B, total_dim, H, W)
-        out = rearrange(attn_out, "b h (h2 w2) c -> b (h c) h2 w2", h2=H, w2=W)
-        return out
-    
-    @torch.autocast(device_type="cuda", enabled=False)
-    def relu_linear_att(self, qkv: torch.Tensor) -> torch.Tensor:
-        B, _, H, W = list(qkv.size())
-
-        if qkv.dtype == torch.float16:
-            qkv = qkv.float()
-
-        qkv = torch.reshape(
-            qkv,
-            (
-                B,
-                -1,
-                3 * self.dim,
-                H * W,
-            ),
-        )
-        q, k, v = (
-            qkv[:, :, 0 : self.dim],
-            qkv[:, :, self.dim : 2 * self.dim],
-            qkv[:, :, 2 * self.dim :],
-        )
-
-        # lightweight linear attention
-        q = self.kernel_func(q)
-        k = self.kernel_func(k)
-
-        # linear matmul
-        trans_k = k.transpose(-1, -2)
-
-        v = F.pad(v, (0, 0, 0, 1), mode="constant", value=1)
-        vk = torch.matmul(v, trans_k)
-        out = torch.matmul(vk, q)
-        if out.dtype == torch.bfloat16:
-            out = out.float()
-        out = out[:, :, :-1] / (out[:, :, -1:] + self.eps)
-
-        out = torch.reshape(out, (B, -1, H, W))
-        return out
-
-
     @autocast(enabled=False)
-    def qt_attention(self, qkv: torch.Tensor) -> torch.Tensor:
+    def qt_attention(self, qkv: torch.Tensor, valid_mask=None) -> torch.Tensor:
         B, _, H, W = list(qkv.size())
-
+        
         if qkv.dtype == torch.float16:
             qkv = qkv.float()
-
-        qkv = torch.reshape(
-            qkv,
-            (
-                B,
-                -1,
-                3 * self.dim,
-                H * W,
-            ),
-        )
+        
+        qkv = torch.reshape(qkv, (B, -1, 3 * self.dim, H * W))
         qkv = torch.transpose(qkv, -1, -2)
         q, k, v = (
             qkv[..., 0 : self.dim],
             qkv[..., self.dim : 2 * self.dim],
             qkv[..., 2 * self.dim :],
         )
-
+        
         Bq, Headq, Nq, Cq = q.shape
+        
+        if valid_mask is not None:
+            if valid_mask.shape[2:] != (H, W):
+                mask = F.interpolate(valid_mask, size=(H, W), mode='nearest')
+            else:
+                mask = valid_mask
+            
+            # Flatten mask and get valid token indices
+            mask_flat = mask.flatten(2)  # Shape: (B, 1, H*W)
+            valid_indices = mask_flat.squeeze(1).bool()  # Shape: (B, H*W)
+            
+            # Extract only valid tokens for each batch
+            max_valid = valid_indices.sum(dim=1).max().item()
+            if max_valid == 0:
+                # No valid tokens, return zeros
+                out = torch.zeros_like(qkv[..., :self.dim])
+                out = torch.transpose(out, -1, -2)
+                return torch.reshape(out, (B, -1, H, W))
+            
+            # Create padded tensors for valid tokens only
+            q_valid = torch.zeros(B, Headq, max_valid, Cq, device=q.device, dtype=q.dtype)
+            k_valid = torch.zeros(B, Headq, max_valid, Cq, device=k.device, dtype=k.dtype)
+            v_valid = torch.zeros(B, Headq, max_valid, Cq, device=v.device, dtype=v.dtype)
+            
+            # Fill valid tokens
+            for b in range(B):
+                n_valid = valid_indices[b].sum().item()
+                if n_valid > 0:
+                    q_valid[b, :, :n_valid] = q[b, :, valid_indices[b]]
+                    k_valid[b, :, :n_valid] = k[b, :, valid_indices[b]]
+                    v_valid[b, :, :n_valid] = v[b, :, valid_indices[b]]
+            
+            # Update working variables
+            q, k, v = q_valid, k_valid, v_valid
+            Nq = max_valid
+        
+        # Positional encoding (only applied to valid tokens now)
         if H != self.positional_encoding.shape[2] or W != self.positional_encoding.shape[3]:
             absolute_pos_embed = F.interpolate(self.positional_encoding, size=(H, W), mode='bicubic').reshape(-1, Headq, Cq, H*W).transpose(-1,-2)
         else:
             absolute_pos_embed = self.positional_encoding.reshape(-1, Headq, Cq, H*W).transpose(-1,-2)
-
-        k = k + absolute_pos_embed
-
-        q = q / (q.norm(dim=-1, keepdim=True) + self.eps) # used for preventing inf/nan during training, can be deleted during inference without changing the output.
-        k = k / (k.norm(dim=-1, keepdim=True) + self.eps) # used for preventing inf/nan during training, can be deleted during inference without changing the output.
+        
+        if valid_mask is not None:
+            # Apply positional encoding only to valid positions
+            pos_embed_valid = torch.zeros(B, Headq, max_valid, Cq, device=k.device, dtype=k.dtype)
+            for b in range(B):
+                n_valid = valid_indices[b].sum().item()
+                if n_valid > 0:
+                    pos_embed_valid[b, :, :n_valid] = absolute_pos_embed[0, :, valid_indices[b]]
+            k = k + pos_embed_valid
+        else:
+            k = k + absolute_pos_embed
+        
+        # Attention computation (unchanged)
+        q = q / (q.norm(dim=-1, keepdim=True) + self.eps)
+        k = k / (k.norm(dim=-1, keepdim=True) + self.eps)
         q = q ** 2
         k = k ** 2
         q = q / (q.norm(dim=-1, keepdim=True) + self.eps)
         k = k / (k.norm(dim=-1, keepdim=True) + self.eps)
-
-        ones = torch.ones(Bq,Headq,Nq,1).to(q.device)
+        
+        ones = torch.ones(Bq, Headq, Nq, 1).to(q.device)
         ones1 = ones * self.ones_scale1
         q = torch.cat((q, ones1), dim=-1)
         k = torch.cat((k, ones1), dim=-1)
         
-        # linear matmul
+        # Linear matmul
         trans_k = k.transpose(-1, -2)
-
         v = F.pad(v, (0, 1), mode="constant", value=1)
         kv = torch.matmul(trans_k, v)
         out = torch.matmul(q, kv)
         out = out[..., :-1] / (out[..., -1:] + self.eps)
-
-        ############# add dwconv
-        num = int(v.shape[2] ** 0.5)
-        e = v.shape[1]
-        feature_map = rearrange(v, "b e (w h) c -> (b e) c w h", w=num, h=num)
-        feature_map = rearrange(self.act(self.bn(feature_map[:,:-1,:,:])), "(b e) c w h -> b e (w h) c", e=e)
-        out = out + feature_map
-        #############
+        
+        # Add dwconv for valid tokens
+        if valid_mask is not None:
+            # For masked case, apply dwconv only to valid tokens
+            feature_map_out = torch.zeros_like(out)
+            for b in range(B):
+                n_valid = valid_indices[b].sum().item()
+                if n_valid > 0 and n_valid == int(n_valid**0.5)**2:  # Only if perfect square
+                    num = int(n_valid ** 0.5)
+                    e = v.shape[1]
+                    valid_v = v[b:b+1, :, :n_valid, :-1]  # Remove padding dimension
+                    feature_map = rearrange(valid_v, "b e (w h) c -> (b e) c w h", w=num, h=num)
+                    feature_map = rearrange(self.act(self.bn(feature_map)), "(b e) c w h -> b e (w h) c", e=e)
+                    feature_map_out[b:b+1, :, :n_valid] = feature_map
+            out = out + feature_map_out
+        else:
+            # Original dwconv logic
+            num = int(v.shape[2] ** 0.5)
+            e = v.shape[1]
+            feature_map = rearrange(v, "b e (w h) c -> (b e) c w h", w=num, h=num)
+            feature_map = rearrange(self.act(self.bn(feature_map[:,:-1,:,:])), "(b e) c w h -> b e (w h) c", e=e)
+            out = out + feature_map
+        
+        # Restore original spatial structure
+        if valid_mask is not None:
+            final_out = torch.zeros(B, Headq, H*W, Cq, device=out.device, dtype=out.dtype)
+            for b in range(B):
+                n_valid = valid_indices[b].sum().item()
+                if n_valid > 0:
+                    final_out[b, :, valid_indices[b]] = out[b, :, :n_valid]
+            out = final_out
         
         out = torch.transpose(out, -1, -2)
         out = torch.reshape(out, (B, -1, H, W))
         return out
 
+    # @autocast(enabled=False)
+    # def qt_attention(self, qkv: torch.Tensor, valid_mask) -> torch.Tensor:
+    #     B, _, H, W = list(qkv.size())
+
+    #     if qkv.dtype == torch.float16:
+    #         qkv = qkv.float()
+
+    #     qkv = torch.reshape(
+    #         qkv,
+    #         (
+    #             B,
+    #             -1,
+    #             3 * self.dim,
+    #             H * W,
+    #         ),
+    #     )
+    #     qkv = torch.transpose(qkv, -1, -2)
+    #     q, k, v = (
+    #         qkv[..., 0 : self.dim],
+    #         qkv[..., self.dim : 2 * self.dim],
+    #         qkv[..., 2 * self.dim :],
+    #     )
+
+    #     Bq, Headq, Nq, Cq = q.shape
+    #     if H != self.positional_encoding.shape[2] or W != self.positional_encoding.shape[3]:
+    #         absolute_pos_embed = F.interpolate(self.positional_encoding, size=(H, W), mode='bicubic').reshape(-1, Headq, Cq, H*W).transpose(-1,-2)
+    #     else:
+    #         absolute_pos_embed = self.positional_encoding.reshape(-1, Headq, Cq, H*W).transpose(-1,-2)
+
+    #     k = k + absolute_pos_embed
+
+    #     q = q / (q.norm(dim=-1, keepdim=True) + self.eps)
+    #     k = k / (k.norm(dim=-1, keepdim=True) + self.eps)
+    #     q = q ** 2
+    #     k = k ** 2
+    #     q = q / (q.norm(dim=-1, keepdim=True) + self.eps)
+    #     k = k / (k.norm(dim=-1, keepdim=True) + self.eps)
+
+    #     ones = torch.ones(Bq,Headq,Nq,1).to(q.device)
+    #     ones1 = ones * self.ones_scale1
+    #     q = torch.cat((q, ones1), dim=-1)
+    #     k = torch.cat((k, ones1), dim=-1)
+        
+    #     # linear matmul
+    #     trans_k = k.transpose(-1, -2)
+
+    #     v = F.pad(v, (0, 1), mode="constant", value=1)
+    #     kv = torch.matmul(trans_k, v)
+    #     out = torch.matmul(q, kv)
+    #     out = out[..., :-1] / (out[..., -1:] + self.eps)
+
+    #     ############# add dwconv
+    #     num = int(v.shape[2] ** 0.5)
+    #     e = v.shape[1]
+    #     feature_map = rearrange(v, "b e (w h) c -> (b e) c w h", w=num, h=num)
+    #     feature_map = rearrange(self.act(self.bn(feature_map[:,:-1,:,:])), "(b e) c w h -> b e (w h) c", e=e)
+    #     out = out + feature_map
+    #     #############
+        
+    #     out = torch.transpose(out, -1, -2)
+    #     out = torch.reshape(out, (B, -1, H, W))
+    #     return out
+
     def forward(self, x: torch.Tensor, valid_mask=None) -> torch.Tensor:
         # generate multi-scale q, k, v
-        qkv = self.qkv(x)
+        qkv = self.qkv(x, valid_mask)
         multi_scale_qkv = [qkv]
-        for op in self.aggreg:
-            multi_scale_qkv.append(op(qkv))
+        
+        for conv1, conv2 in self.aggreg:
+            tmp = conv1(qkv, valid_mask)
+            tmp = conv2(tmp, valid_mask)
+            multi_scale_qkv.append(tmp)
+
         multi_scale_qkv = torch.cat(multi_scale_qkv, dim=1)
 
         # out = self.relu_linear_att(multi_scale_qkv)
         # out = self.softmax_att(multi_scale_qkv)
-        out = self.qt_attention(multi_scale_qkv)
-        out = self.proj(out)
+        out = self.qt_attention(multi_scale_qkv, valid_mask)
+        out = self.proj(out, valid_mask)
 
         return out
 
@@ -613,7 +676,7 @@ class EfficientViTBlock(nn.Module):
         self.local_module = ResidualBlock(local_module, IdentityLayer())#,post_norm=nn.BatchNorm2d(in_channels))
 
     def forward(self, x: torch.Tensor, valid_mask=None) -> torch.Tensor:
-        x = self.context_module(x)
+        x = self.context_module(x, valid_mask)
         x = self.local_module(x, valid_mask)
         return x # ori or deepnorm_nlp
 
