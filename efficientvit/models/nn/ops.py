@@ -68,10 +68,23 @@ class ConvLayer(nn.Module):
         self.norm = build_norm(norm, num_features=out_channels)
         self.act = build_act(act_func)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, valid_mask = None) -> torch.Tensor:
         if self.dropout is not None:
             x = self.dropout(x)
-        x = self.conv(x)
+
+        if valid_mask is not None:
+            if valid_mask.shape[2:] != x.shape[2:]:
+                mask = F.interpolate(valid_mask, size=x.shape[2:], mode='nearest')
+            else:
+                mask = valid_mask
+
+            x = x * mask
+            x = self.conv(x)
+
+            if mask.shape[2:] != x.shape[2:]:
+                mask = F.interpolate(mask, size=x.shape[2:], mode='nearest')
+            x = x * mask
+
         if self.norm:
             x = self.norm(x)
         if self.act:
@@ -133,8 +146,8 @@ class LinearLayer(nn.Module):
 
 
 class IdentityLayer(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x
+    def forward(self, x: torch.Tensor, valid_mask=None) -> torch.Tensor:
+        return x if valid_mask is not None else x * valid_mask
 
 
 #################################################################################
@@ -178,9 +191,9 @@ class DSConv(nn.Module):
             use_bias=use_bias[1],
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.depth_conv(x)
-        x = self.point_conv(x)
+    def forward(self, x: torch.Tensor, valid_mask=None) -> torch.Tensor:
+        x = self.depth_conv(x, valid_mask)
+        x = self.point_conv(x, valid_mask)
         return x
 
 
@@ -232,10 +245,10 @@ class MBConv(nn.Module):
             use_bias=use_bias[2],
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.inverted_conv(x)
-        x = self.depth_conv(x)
-        x = self.point_conv(x)
+    def forward(self, x: torch.Tensor, valid_mask=None) -> torch.Tensor:
+        x = self.inverted_conv(x, valid_mask)
+        x = self.depth_conv(x, valid_mask)
+        x = self.point_conv(x, valid_mask)
         return x
 
 
@@ -279,9 +292,9 @@ class FusedMBConv(nn.Module):
             act_func=act_func[1],
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.spatial_conv(x)
-        x = self.point_conv(x)
+    def forward(self, x: torch.Tensor, valid_mask=None) -> torch.Tensor:
+        x = self.spatial_conv(x, valid_mask)
+        x = self.point_conv(x, valid_mask)
         return x
 
 
@@ -324,9 +337,9 @@ class ResBlock(nn.Module):
             act_func=act_func[1],
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv1(x)
-        x = self.conv2(x)
+    def forward(self, x: torch.Tensor, valid_mask=None) -> torch.Tensor:
+        x = self.conv1(x, valid_mask)
+        x = self.conv2(x, valid_mask)
         return x
 
 
@@ -536,7 +549,7 @@ class LiteMLA(nn.Module):
         out = torch.reshape(out, (B, -1, H, W))
         return out
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, valid_mask=None) -> torch.Tensor:
         # generate multi-scale q, k, v
         qkv = self.qkv(x)
         multi_scale_qkv = [qkv]
@@ -594,10 +607,9 @@ class EfficientViTBlock(nn.Module):
         )
         self.local_module = ResidualBlock(local_module, IdentityLayer())#,post_norm=nn.BatchNorm2d(in_channels))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        print(f"EffVitBlock: x shape {x.shape}")
+    def forward(self, x: torch.Tensor, valid_mask=None) -> torch.Tensor:
         x = self.context_module(x)
-        x = self.local_module(x)
+        x = self.local_module(x, valid_mask)
         return x # ori or deepnorm_nlp
 
 
@@ -621,19 +633,19 @@ class ResidualBlock(nn.Module): # ori
         self.shortcut = shortcut
         self.post_act = build_act(post_act)
 
-    def forward_main(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_main(self, x: torch.Tensor, valid_mask) -> torch.Tensor:
         if self.pre_norm is None:
-            return self.main(x)
+            return self.main(x, valid_mask)
         else:
-            return self.main(self.pre_norm(x))
+            return self.main(self.pre_norm(x), valid_mask)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, valid_mask=None) -> torch.Tensor:
         if self.main is None:
             res = x
         elif self.shortcut is None:
-            res = self.forward_main(x)
+            res = self.forward_main(x, valid_mask)
         else:
-            res = self.forward_main(x) + self.shortcut(x)
+            res = self.forward_main(x, valid_mask) + self.shortcut(x)
             if self.post_act:
                 res = self.post_act(res)
         return res
@@ -684,7 +696,7 @@ class OpSequential(nn.Module):
                 valid_op_list.append(op)
         self.op_list = nn.ModuleList(valid_op_list)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, valid_mask=None) -> torch.Tensor:
         for op in self.op_list:
-            x = op(x)
+            x = op(x, valid_mask)
         return x

@@ -3,6 +3,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from efficientvit.models.nn import (
     ConvLayer,
@@ -41,9 +42,11 @@ class EfficientViTBackbone(nn.Module):
         expand_ratio=4,
         norm="bn2d",
         act_func="hswish",
+        mask_ratio = None,
     ) -> None:
         super().__init__()
 
+        self.mask_ratio = mask_ratio
         self.width_list = []
         # input stem
         self.input_stem = [
@@ -150,12 +153,36 @@ class EfficientViTBackbone(nn.Module):
                 act_func=(act_func, act_func, None),
             )
         return block
+    
+    def generate_mask(self, x: torch.Tensor) -> torch.Tensor:
+        B, _, H, W = x.shape
+        final_h, final_w = H//32, W//32
+        device = x.device
+        
+        # Create mask for each item in batch
+        mask = torch.ones((B, 1, final_h, final_w), device=device)
+        
+        for b in range(B):
+            # Flatten the mask for this batch item
+            mask_flat = mask[b, 0].view(-1)
+            
+            # Randomly select indices to mask
+            num_masked = int(final_h * final_w * self.mask_ratio)
+            masked_indices = torch.randperm(final_h * final_w, device=device)[:num_masked]
+            
+            # Set selected indices to 0 (masked)
+            mask_flat[masked_indices] = 0
+            mask[b, 0] = mask_flat.view(final_h, final_w)
+        
+        return mask
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         output_dict = {"input": x}
-        output_dict["stage0"] = x = self.input_stem(x)
+        if self.mask_ratio:
+            mask = self.generate_mask(x)
+        output_dict["stage0"] = x = self.input_stem(x, mask)
         for stage_id, stage in enumerate(self.stages, 1):
-            output_dict["stage%d" % stage_id] = x = stage(x)
+            output_dict["stage%d" % stage_id] = x = stage(x, mask)
         output_dict["stage_final"] = x
         return output_dict
 
