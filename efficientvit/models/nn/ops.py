@@ -147,7 +147,10 @@ class LinearLayer(nn.Module):
 
 class IdentityLayer(nn.Module):
     def forward(self, x: torch.Tensor, valid_mask=None) -> torch.Tensor:
-        return x if valid_mask is not None else x * valid_mask
+        if valid_mask is not None:
+            return x * valid_mask
+        else:
+            return x
 
 
 #################################################################################
