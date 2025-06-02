@@ -84,6 +84,8 @@ class ConvLayer(nn.Module):
             if mask.shape[2:] != x.shape[2:]:
                 mask = F.interpolate(mask, size=x.shape[2:], mode='nearest')
             x = x * mask
+        else:
+            x = self.conv(x)
 
         if self.norm:
             x = self.norm(x)
