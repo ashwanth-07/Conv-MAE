@@ -180,6 +180,8 @@ class EfficientViTBackbone(nn.Module):
         output_dict = {"input": x}
         if self.mask_ratio:
             mask = self.generate_mask(x)
+        else:
+            mask = None
         output_dict["stage0"] = x = self.input_stem(x, mask)
         for stage_id, stage in enumerate(self.stages, 1):
             output_dict["stage%d" % stage_id] = x = stage(x, mask)
