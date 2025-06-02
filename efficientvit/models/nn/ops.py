@@ -650,7 +650,7 @@ class ResidualBlock(nn.Module): # ori
         elif self.shortcut is None:
             res = self.forward_main(x, valid_mask)
         else:
-            res = self.forward_main(x, valid_mask) + self.shortcut(x)
+            res = self.forward_main(x, valid_mask) + self.shortcut(x, valid_mask)
             if self.post_act:
                 res = self.post_act(res)
         return res
