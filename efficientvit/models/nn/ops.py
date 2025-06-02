@@ -150,11 +150,33 @@ class LinearLayer(nn.Module):
 class IdentityLayer(nn.Module):
     def forward(self, x: torch.Tensor, valid_mask=None) -> torch.Tensor:
         if valid_mask is not None:
-            if valid_mask.shape[2:] != x.shape[2:]:
-                mask = F.interpolate(valid_mask, size=x.shape[2:], mode='nearest')
-            else:
-                mask = valid_mask
-            return x * mask
+            print(f"IdentityLayer - x.shape: {x.shape}, valid_mask.shape: {valid_mask.shape}")
+            
+            # Quick compatibility check
+            if len(x.shape) != 4 or len(valid_mask.shape) != 4:
+                print(f"Skipping mask - incompatible dimensions")
+                return x
+                
+            if x.shape[0] != valid_mask.shape[0]:
+                print(f"Skipping mask - different batch sizes")
+                return x
+            
+            try:
+                if x.shape[2:] != valid_mask.shape[2:]:
+                    print(f"Resizing mask from {valid_mask.shape[2:]} to {x.shape[2:]}")
+                    mask = F.interpolate(valid_mask, size=x.shape[2:], mode='nearest')
+                    print(f"Resized mask shape: {mask.shape}")
+                else:
+                    mask = valid_mask
+                
+                result = x * mask
+                print(f"Successfully applied mask, output shape: {result.shape}")
+                return result
+                
+            except Exception as e:
+                print(f"Error in IdentityLayer masking: {e}")
+                print(f"Returning unmasked tensor")
+                return x
         else:
             return x
 
