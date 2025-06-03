@@ -519,19 +519,30 @@ class LiteMLA(nn.Module):
         out = torch.matmul(q, kv)
         out = out[..., :-1] / (out[..., -1:] + self.eps)
         
-        # Add dwconv for valid tokens
         if valid_mask is not None:
-            # For masked case, apply dwconv only to valid tokens
+            # For masked case, apply dwconv to valid tokens with pad-to-square strategy
             feature_map_out = torch.zeros_like(out)
             for b in range(B):
                 n_valid = valid_indices[b].sum().item()
-                if n_valid > 0 and n_valid == int(n_valid**0.5)**2:  # Only if perfect square
-                    num = int(n_valid ** 0.5)
+                if n_valid > 0:
                     e = v.shape[1]
                     valid_v = v[b:b+1, :, :n_valid, :-1]  # Remove padding dimension
-                    feature_map = rearrange(valid_v, "b e (w h) c -> (b e) c w h", w=num, h=num)
-                    feature_map = rearrange(self.act(self.bn(feature_map)), "(b e) c w h -> b e (w h) c", e=e)
-                    feature_map_out[b:b+1, :, :n_valid] = feature_map
+                    
+                    # Pad to next square
+                    sqrt_ceil = int(n_valid**0.5) + (1 if n_valid > int(n_valid**0.5)**2 else 0)
+                    target_size = sqrt_ceil * sqrt_ceil
+                    
+                    # Pad valid tokens to square size
+                    padded_v = F.pad(valid_v, (0, 0, 0, target_size - n_valid), mode='constant', value=0)
+                    
+                    # Apply dwconv
+                    feature_map = rearrange(padded_v, "b e (h w) c -> (b e) c h w", h=sqrt_ceil, w=sqrt_ceil)
+                    feature_map = self.act(self.bn(feature_map))
+                    feature_map = rearrange(feature_map, "(b e) c h w -> b e (h w) c", e=e)
+                    
+                    # Extract only valid parts back
+                    feature_map_out[b:b+1, :, :n_valid] = feature_map[b:b+1, :, :n_valid]
+            
             out = out + feature_map_out
         else:
             # Original dwconv logic
