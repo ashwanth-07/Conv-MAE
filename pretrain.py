@@ -561,7 +561,7 @@ def main():
                         help='Weight decay')
     
     # Dataset parameters
-    parser.add_argument('--data_path', default='/content/imagenet/', type=str,
+    parser.add_argument('--data_path', default='/content/imagenet-s/', type=str,
                         help='Dataset path')
     parser.add_argument('--image_size', default=224, type=int,
                         help='Input image size')
