@@ -7,7 +7,7 @@ from torch.nn.modules.batchnorm import _BatchNorm
 
 from efficientvit.models.utils import build_kwargs_from_config
 
-__all__ = ["LayerNorm2d", "build_norm", "reset_bn", "set_norm_eps"]
+__all__ = ["LayerNorm2d", "BatchNorm2d", "build_norm", "reset_bn", "set_norm_eps"]
 
 
 class LayerNorm2d(nn.LayerNorm):
@@ -18,10 +18,90 @@ class LayerNorm2d(nn.LayerNorm):
             out = out * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
         return out
 
-
+class BatchNorm2d(nn.Module):
+    """
+    BatchNorm2d that can optionally normalize only valid (unmasked) pixels.
+    When no mask is provided, behaves identically to nn.BatchNorm2d.
+    """
+    
+    def __init__(self, num_features, eps=1e-5, momentum=0.1):
+        super().__init__()
+        self.eps = eps
+        self.momentum = momentum
+        
+        # Learnable parameters
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        
+        # Running statistics
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+        
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: Input tensor (B, C, H, W)
+            mask: Optional boolean mask (B, H, W) where True = valid pixel
+                  If None, applies standard batch normalization to all pixels
+        """
+        B, C, H, W = x.shape
+        
+        # If no mask provided, use standard batch normalization
+        if mask is None:
+            if self.training:
+                # Standard batch norm computation
+                mean = x.mean(dim=(0, 2, 3))  # (C,)
+                var = x.var(dim=(0, 2, 3), unbiased=False)  # (C,)
+                
+                # Update running statistics
+                self.running_mean.mul_(1 - self.momentum).add_(mean.detach(), alpha=self.momentum)
+                self.running_var.mul_(1 - self.momentum).add_(var.detach(), alpha=self.momentum)
+            else:
+                # Use running statistics
+                mean = self.running_mean
+                var = self.running_var
+            
+            # Normalize all pixels
+            mean = mean.view(1, C, 1, 1)
+            var = var.view(1, C, 1, 1)
+            weight = self.weight.view(1, C, 1, 1)
+            bias = self.bias.view(1, C, 1, 1)
+            
+            return (x - mean) / torch.sqrt(var + self.eps) * weight + bias
+        
+        # Masked batch normalization - always compute from valid pixels when mask is provided
+        # Expand mask to match input: (B, H, W) -> (B, C, H, W)
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(1).expand(B, C, H, W)
+        
+        # Count valid pixels per channel
+        valid_count = mask.sum(dim=(0, 2, 3))  # (C,)
+        
+        # Compute mean and variance only on valid pixels
+        masked_x = x * mask.float()
+        mean = masked_x.sum(dim=(0, 2, 3)) / valid_count.clamp(min=1)  # (C,)
+        
+        var = ((x - mean.view(1, C, 1, 1)) ** 2 * mask.float()).sum(dim=(0, 2, 3)) / valid_count.clamp(min=1)
+        
+        # Update running statistics only during training
+        if self.training:
+            self.running_mean.mul_(1 - self.momentum).add_(mean.detach(), alpha=self.momentum)
+            self.running_var.mul_(1 - self.momentum).add_(var.detach(), alpha=self.momentum)
+        
+        # Normalize
+        mean = mean.view(1, C, 1, 1)
+        var = var.view(1, C, 1, 1)
+        weight = self.weight.view(1, C, 1, 1)
+        bias = self.bias.view(1, C, 1, 1)
+        
+        x_norm = (x - mean) / torch.sqrt(var + self.eps) * weight + bias
+        
+        # Only apply normalization to valid pixels
+        return torch.where(mask, x_norm, x)
+    
 # register normalization function here
 REGISTERED_NORM_DICT: dict[str, type] = {
-    "bn2d": nn.BatchNorm2d,
+    "bn2d": BatchNorm2d,
     "ln": nn.LayerNorm,
     "ln2d": LayerNorm2d,
 }

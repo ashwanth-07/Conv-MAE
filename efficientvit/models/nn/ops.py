@@ -88,7 +88,7 @@ class ConvLayer(nn.Module):
             x = self.conv(x)
 
         if self.norm:
-            x = self.norm(x)
+            x = self.norm(x, valid_mask)
         if self.act:
             x = self.act(x)
         return x
@@ -541,69 +541,6 @@ class LiteMLA(nn.Module):
         out = torch.transpose(out, -1, -2)
         out = torch.reshape(out, (B, -1, H, W))
         return out
-
-    # @autocast(enabled=False)
-    # def qt_attention(self, qkv: torch.Tensor, valid_mask) -> torch.Tensor:
-    #     B, _, H, W = list(qkv.size())
-
-    #     if qkv.dtype == torch.float16:
-    #         qkv = qkv.float()
-
-    #     qkv = torch.reshape(
-    #         qkv,
-    #         (
-    #             B,
-    #             -1,
-    #             3 * self.dim,
-    #             H * W,
-    #         ),
-    #     )
-    #     qkv = torch.transpose(qkv, -1, -2)
-    #     q, k, v = (
-    #         qkv[..., 0 : self.dim],
-    #         qkv[..., self.dim : 2 * self.dim],
-    #         qkv[..., 2 * self.dim :],
-    #     )
-
-    #     Bq, Headq, Nq, Cq = q.shape
-    #     if H != self.positional_encoding.shape[2] or W != self.positional_encoding.shape[3]:
-    #         absolute_pos_embed = F.interpolate(self.positional_encoding, size=(H, W), mode='bicubic').reshape(-1, Headq, Cq, H*W).transpose(-1,-2)
-    #     else:
-    #         absolute_pos_embed = self.positional_encoding.reshape(-1, Headq, Cq, H*W).transpose(-1,-2)
-
-    #     k = k + absolute_pos_embed
-
-    #     q = q / (q.norm(dim=-1, keepdim=True) + self.eps)
-    #     k = k / (k.norm(dim=-1, keepdim=True) + self.eps)
-    #     q = q ** 2
-    #     k = k ** 2
-    #     q = q / (q.norm(dim=-1, keepdim=True) + self.eps)
-    #     k = k / (k.norm(dim=-1, keepdim=True) + self.eps)
-
-    #     ones = torch.ones(Bq,Headq,Nq,1).to(q.device)
-    #     ones1 = ones * self.ones_scale1
-    #     q = torch.cat((q, ones1), dim=-1)
-    #     k = torch.cat((k, ones1), dim=-1)
-        
-    #     # linear matmul
-    #     trans_k = k.transpose(-1, -2)
-
-    #     v = F.pad(v, (0, 1), mode="constant", value=1)
-    #     kv = torch.matmul(trans_k, v)
-    #     out = torch.matmul(q, kv)
-    #     out = out[..., :-1] / (out[..., -1:] + self.eps)
-
-    #     ############# add dwconv
-    #     num = int(v.shape[2] ** 0.5)
-    #     e = v.shape[1]
-    #     feature_map = rearrange(v, "b e (w h) c -> (b e) c w h", w=num, h=num)
-    #     feature_map = rearrange(self.act(self.bn(feature_map[:,:-1,:,:])), "(b e) c w h -> b e (w h) c", e=e)
-    #     out = out + feature_map
-    #     #############
-        
-    #     out = torch.transpose(out, -1, -2)
-    #     out = torch.reshape(out, (B, -1, H, W))
-    #     return out
 
     def forward(self, x: torch.Tensor, valid_mask=None) -> torch.Tensor:
         # generate multi-scale q, k, v
