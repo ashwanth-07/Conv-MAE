@@ -88,7 +88,7 @@ class ConvLayer(nn.Module):
             x = self.conv(x)
 
         if self.norm:
-            x = self.norm(x, valid_mask)
+            x = self.norm(x, mask)
         if self.act:
             x = self.act(x)
         return x
