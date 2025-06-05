@@ -249,7 +249,7 @@ def run_timing_analysis(
         mask_ratio=0.75,
         decoder_dim=512,
         decoder_depth=8,
-        patch_size=16
+        patch_size=32
     ).to(device)
     
     # Count parameters
