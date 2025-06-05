@@ -166,7 +166,7 @@ class ConvMAEDecoder(nn.Module):
         
         expected_mask_shape = (B, 1, H16, W16)
         if mask.shape != expected_mask_shape:
-            raise ValueError(f"Expected mask shape {expected_mask_shape}, got {mask.shape}")
+            mask = F.interpolate(mask, size=(H16, W16), mode='nearest')
 
         feat1 = self.proj_e1(multi_scale_features[0])
         feat2 = self.proj_e2(multi_scale_features[1])
