@@ -78,10 +78,10 @@ class BatchNorm2d(nn.Module):
         valid_count = mask.sum(dim=(0, 2, 3))  # (C,)
         
         # Compute mean and variance only on valid pixels
-        masked_x = x * mask.float()
+        masked_x = x * mask.bool()
         mean = masked_x.sum(dim=(0, 2, 3)) / valid_count.clamp(min=1)  # (C,)
         
-        var = ((x - mean.view(1, C, 1, 1)) ** 2 * mask.float()).sum(dim=(0, 2, 3)) / valid_count.clamp(min=1)
+        var = ((x - mean.view(1, C, 1, 1)) ** 2 * mask.bool()).sum(dim=(0, 2, 3)) / valid_count.clamp(min=1)
         
         # Update running statistics only during training
         if self.training:
