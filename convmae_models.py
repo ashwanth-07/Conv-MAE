@@ -61,7 +61,7 @@ class PositionalEncoding2D(nn.Module):
     
     def forward(self, x: torch.Tensor):
         # x: B, N, C
-        return x + self.pos_embed
+        return x + self.pos_embed.to(x.device)
 
 
 class TransformerBlock(nn.Module):
