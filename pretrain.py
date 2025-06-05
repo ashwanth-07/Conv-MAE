@@ -573,9 +573,9 @@ def main():
                         help='Path where to save, empty for no saving')
     parser.add_argument('--log_freq', default=50, type=int,
                         help='Log frequency')
-    parser.add_argument('--print_freq', default=100, type=int,
+    parser.add_argument('--print_freq', default=10, type=int,
                         help='Print frequency')
-    parser.add_argument('--vis_freq', default=500, type=int,
+    parser.add_argument('--vis_freq', default=50, type=int,
                         help='Visualization frequency')
     parser.add_argument('--save_freq', default=50, type=int,
                         help='Save checkpoint frequency')
