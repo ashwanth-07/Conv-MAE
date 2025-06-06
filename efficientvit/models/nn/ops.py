@@ -554,8 +554,6 @@ class LiteMLA(nn.Module):
 
         multi_scale_qkv = torch.cat(multi_scale_qkv, dim=1)
 
-        # out = self.relu_linear_att(multi_scale_qkv)
-        # out = self.softmax_att(multi_scale_qkv)
         out = self.qt_attention(multi_scale_qkv, valid_mask)
         out = self.proj(out, valid_mask)
 

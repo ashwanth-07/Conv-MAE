@@ -1,5 +1,4 @@
 # Modifications Copyright © 2025 Advanced Micro Devices, Inc. All rights reserved.
-#
 
 import torch
 import torch.nn as nn
@@ -29,18 +28,16 @@ class TransformerBlock(nn.Module):
 
 
 class PositionalEncoding2D(nn.Module):
-    """2D sine–cosine positional encoding."""
     def __init__(self, channels, height, width):
         super().__init__()
         self.channels = channels
         self.height = height
         self.width = width
-
         pe = self._get_2d_sincos_pos_embed(channels, height, width)
         self.register_buffer('pos_embed', pe)
 
     def _get_2d_sincos_pos_embed(self, embed_dim, grid_h, grid_w):
-        assert embed_dim % 2 == 0, "Embedding dimension must be even"
+        assert embed_dim % 2 == 0
         
         emb_h = self._get_1d_sincos_pos_embed(embed_dim // 2, grid_h)
         emb_w = self._get_1d_sincos_pos_embed(embed_dim // 2, grid_w)
@@ -67,22 +64,17 @@ class PositionalEncoding2D(nn.Module):
 
     def forward(self, tokens):
         B, N, D = tokens.shape
-        assert N == self.height * self.width, f"Expected {self.height * self.width} tokens, got {N}"
-        assert D == self.channels, f"Expected {self.channels} channels, got {D}"
+        assert N == self.height * self.width
+        assert D == self.channels
         
         pe = self.pos_embed.unsqueeze(0).expand(B, -1, -1)
         return tokens + pe.to(tokens.device)
 
 
 class ConvMAEDecoder(nn.Module):
-    """
-    Extended ConvMAE multi-scale decoder that projects encoder features from 
-    H/4, H/8, H/16, H/32 to H/16 resolution, fuses via concatenation + MLP,
-    applies transformer processing, and reconstructs the full image.
-    """
     def __init__(
         self,
-        encoder_dims: list,      # [C1, C2, C3, C4] for H/4, H/8, H/16, H/32
+        encoder_dims: list,
         decoder_dim: int = 512,
         decoder_depth: int = 8,
         decoder_num_heads: int = 16,
@@ -94,8 +86,8 @@ class ConvMAEDecoder(nn.Module):
     ):
         super().__init__()
 
-        assert len(encoder_dims) == 4, f"Expected 4 encoder dimensions, got {len(encoder_dims)}"
-        assert decoder_dim % decoder_num_heads == 0, f"decoder_dim ({decoder_dim}) must be divisible by num_heads ({decoder_num_heads})"
+        assert len(encoder_dims) == 4
+        assert decoder_dim % decoder_num_heads == 0
 
         self.encoder_dims = encoder_dims
         self.decoder_dim = decoder_dim
@@ -134,6 +126,10 @@ class ConvMAEDecoder(nn.Module):
         self.decoder_norm = norm_layer(decoder_dim)
         self.decoder_pred = nn.Linear(decoder_dim, patch_size**2 * in_channels, bias=True)
 
+        # Cache ImageNet normalization stats
+        self.register_buffer('imagenet_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('imagenet_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -148,6 +144,34 @@ class ConvMAEDecoder(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
+    def patchify(self, imgs):
+        """
+        imgs: (N, 3, H, W)
+        x: (N, L, patch_size**2 * 3)
+        """
+        p = self.patch_size
+        assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
+
+        h = w = imgs.shape[2] // p
+        x = imgs.reshape(shape=(imgs.shape[0], 3, h, p, w, p))
+        x = torch.einsum('nchpwq->nhwpqc', x)
+        x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * 3))
+        return x
+
+    def unpatchify(self, x):
+        """
+        x: (N, L, patch_size**2 * 3)
+        imgs: (N, 3, H, W)
+        """
+        p = self.patch_size
+        h = w = int(x.shape[1]**.5)
+        assert h * w == x.shape[1]
+        
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, 3))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], 3, h * p, h * p))
+        return imgs
+
     def _init_pos_embed(self, H: int, W: int):
         if (self.pos_embed is None or 
             self.pos_embed.height != H or 
@@ -159,7 +183,7 @@ class ConvMAEDecoder(nn.Module):
             )
 
     def forward(self, multi_scale_features: list, mask: torch.Tensor) -> torch.Tensor:
-        assert len(multi_scale_features) == 4, f"Expected 4 feature maps, got {len(multi_scale_features)}"
+        assert len(multi_scale_features) == 4
         
         B = multi_scale_features[0].shape[0]
         _, _, H16, W16 = multi_scale_features[2].shape
@@ -208,12 +232,8 @@ class ConvMAEDecoder(nn.Module):
             x = blk(x)
 
         x = self.decoder_norm(x)
-        pred = self.decoder_pred(x)
+        pred = self.decoder_pred(x)  # [N, L, patch_size**2 * 3]
 
-        pred = pred.view(B, H16, W16, self.patch_size, self.patch_size, self.in_channels)
-        pred = pred.permute(0, 5, 1, 3, 2, 4)
-        pred = pred.reshape(B, self.in_channels, H16 * self.patch_size, W16 * self.patch_size)
-        
         return pred
 
     def forward_loss(
@@ -223,27 +243,55 @@ class ConvMAEDecoder(nn.Module):
         mask: torch.Tensor,
         norm_pix_loss: bool = True
     ) -> torch.Tensor:
-        if mask.shape[-2:] != imgs.shape[-2:]:
-            mask_resized = F.interpolate(mask.float(), size=imgs.shape[-2:], mode='nearest')
+        """
+        Forward loss following official ConvMAE style
+        imgs: [N, 3, H, W]
+        pred: [N, L, patch_size**2 * 3]
+        mask: [N, 1, H_mask, W_mask], 0 is keep, 1 is remove
+        """
+        # Resize mask to match prediction resolution
+        B, _, H, W = imgs.shape
+        patch_size = self.patch_size
+        L = (H // patch_size) * (W // patch_size)
+        
+        if mask.shape[-2:] != (H // patch_size, W // patch_size):
+            mask_resized = F.interpolate(
+                mask.float(), 
+                size=(H // patch_size, W // patch_size), 
+                mode='nearest'
+            )
         else:
             mask_resized = mask.float()
         
-        loss_mask = 1 - mask_resized
+        # Flatten mask to match prediction shape: [N, L]
+        mask_flat = mask_resized.flatten(2).squeeze(1)  # [N, L]
         
         if norm_pix_loss:
-            mean = imgs.mean(dim=(2, 3), keepdim=True)
-            var = imgs.var(dim=(2, 3), keepdim=True)
-            target = (imgs - mean) / (var + 1e-6).sqrt()
+            # Denormalize ImageNet-normalized images back to [0,1]
+            imgs_denorm = imgs * self.imagenet_std + self.imagenet_mean
+            imgs_denorm = torch.clamp(imgs_denorm, 0.0, 1.0)
+            
+            # Patchify the denormalized images (following official ConvMAE)
+            target = self.patchify(imgs_denorm)  # [N, L, patch_size**2 * 3]
+            
+            # Per-patch normalization (exactly like official ConvMAE)
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1e-6)**.5
         else:
-            target = imgs
+            # Use ImageNet-normalized images directly
+            target = self.patchify(imgs)  # [N, L, patch_size**2 * 3]
         
-        loss = (pred - target).pow(2)
-        loss = loss.mean(dim=1, keepdim=True)
-        loss = (loss * loss_mask).sum() / (loss_mask.sum() + 1e-8)
+        # Compute loss (exactly like official ConvMAE)
+        loss = (pred - target) ** 2
+        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
+        
+        # Mean loss on removed patches only
+        loss = (loss * mask_flat).sum() / mask_flat.sum()
         
         return loss
 
-# Example usage function
+
 def create_convmae_decoder_for_efficientvit(
     backbone_name: str = "b2",
     decoder_dim: int = 512,
@@ -251,20 +299,15 @@ def create_convmae_decoder_for_efficientvit(
     decoder_num_heads: int = 16,
     patch_size: int = 16
 ) -> ConvMAEDecoder:
-    """
-    Create ConvMAE decoder configured for specific EfficientViT backbone
-    """
-    # Define encoder dimensions for different EfficientViT models
-    # Uses 4 stages: [stage1, stage2, stage3, stage4] corresponding to [H/4, H/8, H/16, H/32]
     backbone_configs = {
-        "b0": [16, 32, 64, 128],      # stages 1, 2, 3, 4
-        "b1": [32, 64, 128, 256],     # stages 1, 2, 3, 4
-        "b2": [48, 96, 192, 384],     # stages 1, 2, 3, 4
-        "b3": [64, 128, 256, 512],    # stages 1, 2, 3, 4
-        "l0": [64, 128, 256, 512],    # stages 1, 2, 3, 4
-        "l1": [64, 128, 256, 512],    # stages 1, 2, 3, 4
-        "l2": [64, 128, 256, 512],    # stages 1, 2, 3, 4
-        "l3": [128, 256, 512, 1024],  # stages 1, 2, 3, 4
+        "b0": [16, 32, 64, 128],
+        "b1": [32, 64, 128, 256],
+        "b2": [48, 96, 192, 384],
+        "b3": [64, 128, 256, 512],
+        "l0": [64, 128, 256, 512],
+        "l1": [64, 128, 256, 512],
+        "l2": [64, 128, 256, 512],
+        "l3": [128, 256, 512, 1024],
     }
     
     if backbone_name not in backbone_configs:
@@ -283,10 +326,7 @@ def create_convmae_decoder_for_efficientvit(
     return decoder
 
 
-# Complete usage example with EfficientViT backbone
 class ConvMAEPretrainer(nn.Module):
-    """Complete ConvMAE pretrainer with EfficientViT backbone"""
-    
     def __init__(
         self,
         backbone_name: str = "b2",
@@ -294,11 +334,11 @@ class ConvMAEPretrainer(nn.Module):
         decoder_dim: int = 512,
         decoder_depth: int = 8,
         decoder_num_heads: int = 16,
-        patch_size: int = 16
+        patch_size: int = 16,
+        norm_pix_loss: bool = True
     ):
         super().__init__()
         
-        # Create backbone with masking enabled
         if backbone_name == "b0":
             from efficientvit.models.efficientvit.backbone import efficientvit_backbone_b0
             self.backbone = efficientvit_backbone_b0(mask_ratio=mask_ratio)
@@ -314,7 +354,6 @@ class ConvMAEPretrainer(nn.Module):
         else:
             raise ValueError(f"Unsupported backbone: {backbone_name}")
         
-        # Create decoder
         self.decoder = create_convmae_decoder_for_efficientvit(
             backbone_name=backbone_name,
             decoder_dim=decoder_dim,
@@ -324,37 +363,20 @@ class ConvMAEPretrainer(nn.Module):
         )
         
         self.mask_ratio = mask_ratio
+        self.norm_pix_loss = norm_pix_loss
     
     def forward(self, images: torch.Tensor):
-        """
-        Forward pass for pretraining
-        
-        Args:
-            images: Input images (B, 3, H, W)
-        
-        Returns:
-            pred: Reconstructed images (B, 3, H, W)
-            loss: Reconstruction loss
-            mask: Applied mask
-        """
-        # Get multi-scale features from backbone
         backbone_output = self.backbone(images)
         
-        # Extract 4 stages for ConvMAEDecoder
         multi_scale_features = [
-            backbone_output["stage1"],  # H/4 resolution
-            backbone_output["stage2"],  # H/8 resolution
-            backbone_output["stage3"],  # H/16 resolution
-            backbone_output["stage4"],  # H/32 resolution
+            backbone_output["stage1"],
+            backbone_output["stage2"],
+            backbone_output["stage3"],
+            backbone_output["stage4"],
         ]
         
-        # Generate mask (this should be done inside the backbone)
         mask = self.backbone.generate_mask(images)
-        
-        # Decode
-        pred = self.decoder(multi_scale_features, mask)
-        
-        # Compute loss
-        loss = self.decoder.forward_loss(images, pred, mask)
+        pred = self.decoder(multi_scale_features, mask)  # [N, L, patch_size**2 * 3]
+        loss = self.decoder.forward_loss(images, pred, mask, self.norm_pix_loss)
         
         return pred, loss, mask
