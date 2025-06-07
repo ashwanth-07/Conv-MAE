@@ -23,20 +23,17 @@ class BatchNorm2d(nn.Module):
     BatchNorm2d that can optionally normalize only valid (unmasked) pixels.
     When no mask is provided, behaves identically to nn.BatchNorm2d.
     """
-    
     def __init__(self, num_features, eps=1e-5, momentum=0.1):
         super().__init__()
         self.eps = eps
         self.momentum = momentum
-        
         # Learnable parameters
         self.weight = nn.Parameter(torch.ones(num_features))
         self.bias = nn.Parameter(torch.zeros(num_features))
-        
         # Running statistics
         self.register_buffer('running_mean', torch.zeros(num_features))
         self.register_buffer('running_var', torch.ones(num_features))
-        
+    
     def forward(self, x, mask=None):
         """
         Args:
@@ -45,6 +42,7 @@ class BatchNorm2d(nn.Module):
                   If None, applies standard batch normalization to all pixels
         """
         B, C, H, W = x.shape
+        device = x.device  # Ensure all operations use the same device as input
         
         # If no mask provided, use standard batch normalization
         if mask is None:
@@ -66,38 +64,50 @@ class BatchNorm2d(nn.Module):
             var = var.view(1, C, 1, 1)
             weight = self.weight.view(1, C, 1, 1)
             bias = self.bias.view(1, C, 1, 1)
-            
             return (x - mean) / torch.sqrt(var + self.eps) * weight + bias
         
         # Masked batch normalization - always compute from valid pixels when mask is provided
+        # Ensure mask is on the same device as input
+        if mask.device != device:
+            mask = mask.to(device)
+        
         # Expand mask to match input: (B, H, W) -> (B, C, H, W)
         if mask.dim() == 3:
             mask = mask.unsqueeze(1).expand(B, C, H, W)
         
-        # Count valid pixels per channel
-        valid_count = mask.sum(dim=(0, 2, 3))  # (C,)
+        # Count valid pixels per channel - ensure result is on correct device
+        valid_count = mask.sum(dim=(0, 2, 3)).to(device)  # (C,)
         
         # Compute mean and variance only on valid pixels
         masked_x = x * mask
         mean = masked_x.sum(dim=(0, 2, 3)) / valid_count.clamp(min=1)  # (C,)
         
-        var = ((x - mean.view(1, C, 1, 1)) ** 2 * mask).sum(dim=(0, 2, 3)) / valid_count.clamp(min=1)
+        # Compute variance - ensure all intermediate tensors are on correct device
+        mean_expanded = mean.view(1, C, 1, 1)
+        var = ((x - mean_expanded) ** 2 * mask).sum(dim=(0, 2, 3)) / valid_count.clamp(min=1)
         
         # Update running statistics only during training
         if self.training:
+            # Ensure running statistics stay on the same device
+            if self.running_mean.device != device:
+                self.running_mean = self.running_mean.to(device)
+            if self.running_var.device != device:
+                self.running_var = self.running_var.to(device)
+                
             self.running_mean.mul_(1 - self.momentum).add_(mean.detach(), alpha=self.momentum)
             self.running_var.mul_(1 - self.momentum).add_(var.detach(), alpha=self.momentum)
         
-        # Normalize
+        # Normalize - ensure all tensors are on correct device
         mean = mean.view(1, C, 1, 1)
         var = var.view(1, C, 1, 1)
-        weight = self.weight.view(1, C, 1, 1)
-        bias = self.bias.view(1, C, 1, 1)
+        weight = self.weight.view(1, C, 1, 1).to(device)
+        bias = self.bias.view(1, C, 1, 1).to(device)
         
         x_norm = (x - mean) / torch.sqrt(var + self.eps) * weight + bias
         
-        # Only apply normalization to valid pixels
-        return torch.where(mask.bool(), x_norm, x)
+        # Only apply normalization to valid pixels - ensure mask is boolean and on correct device
+        mask_bool = mask.bool().to(device)
+        return torch.where(mask_bool, x_norm, x)
     
 # register normalization function here
 REGISTERED_NORM_DICT: dict[str, type] = {

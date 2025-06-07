@@ -430,125 +430,9 @@ class LiteMLA(nn.Module):
         self.ones_scale1 = nn.Parameter(torch.tensor(1.))
         self.positional_encoding = nn.Parameter(torch.zeros(size=(1, heads*dim*2, 224//downsample, 224//downsample)))
     
-    # @autocast(enabled=False)
-    # def qt_attention(self, qkv: torch.Tensor, valid_mask=None) -> torch.Tensor:
-    #     B, _, H, W = list(qkv.size())
-        
-    #     if qkv.dtype == torch.float16:
-    #         qkv = qkv.float()
-        
-    #     qkv = torch.reshape(qkv, (B, -1, 3 * self.dim, H * W))
-    #     qkv = torch.transpose(qkv, -1, -2)
-    #     q, k, v = (
-    #         qkv[..., 0 : self.dim],
-    #         qkv[..., self.dim : 2 * self.dim],
-    #         qkv[..., 2 * self.dim :],
-    #     )
-        
-    #     Bq, Headq, Nq, Cq = q.shape
-        
-    #     if valid_mask is not None:
-    #         if valid_mask.shape[2:] != (H, W):
-    #             mask = F.interpolate(valid_mask, size=(H, W), mode='nearest')
-    #         else:
-    #             mask = valid_mask
-            
-    #         # Flatten mask and get valid token indices
-    #         mask_flat = mask.flatten(2)  # Shape: (B, 1, H*W)
-    #         valid_indices = mask_flat.squeeze(1).bool()  # Shape: (B, H*W)
-            
-    #         # Extract only valid tokens for each batch
-    #         max_valid = valid_indices.sum(dim=1).max().item()
-    #         if max_valid == 0:
-    #             # No valid tokens, return zeros
-    #             out = torch.zeros_like(qkv[..., :self.dim])
-    #             out = torch.transpose(out, -1, -2)
-    #             return torch.reshape(out, (B, -1, H, W))
-            
-    #         # Create padded tensors for valid tokens only
-    #         q_valid = torch.zeros(B, Headq, max_valid, Cq, device=q.device, dtype=q.dtype)
-    #         k_valid = torch.zeros(B, Headq, max_valid, Cq, device=k.device, dtype=k.dtype)
-    #         v_valid = torch.zeros(B, Headq, max_valid, Cq, device=v.device, dtype=v.dtype)
-            
-    #         # Fill valid tokens
-    #         for b in range(B):
-    #             n_valid = valid_indices[b].sum().item()
-    #             if n_valid > 0:
-    #                 q_valid[b, :, :n_valid] = q[b, :, valid_indices[b]]
-    #                 k_valid[b, :, :n_valid] = k[b, :, valid_indices[b]]
-    #                 v_valid[b, :, :n_valid] = v[b, :, valid_indices[b]]
-            
-    #         # Update working variables
-    #         q, k, v = q_valid, k_valid, v_valid
-    #         Nq = max_valid
-        
-    #     # Positional encoding (only applied to valid tokens now)
-    #     if H != self.positional_encoding.shape[2] or W != self.positional_encoding.shape[3]:
-    #         absolute_pos_embed = F.interpolate(self.positional_encoding, size=(H, W), mode='bicubic').reshape(-1, Headq, Cq, H*W).transpose(-1,-2)
-    #     else:
-    #         absolute_pos_embed = self.positional_encoding.reshape(-1, Headq, Cq, H*W).transpose(-1,-2)
-        
-    #     if valid_mask is not None:
-    #         # Apply positional encoding only to valid positions
-    #         pos_embed_valid = torch.zeros(B, Headq, max_valid, Cq, device=k.device, dtype=k.dtype)
-    #         for b in range(B):
-    #             n_valid = valid_indices[b].sum().item()
-    #             if n_valid > 0:
-    #                 pos_embed_valid[b, :, :n_valid] = absolute_pos_embed[0, :, valid_indices[b]]
-    #         k = k + pos_embed_valid
-    #     else:
-    #         k = k + absolute_pos_embed
-        
-    #     # Attention computation (unchanged)
-    #     q = q / (q.norm(dim=-1, keepdim=True) + self.eps)
-    #     k = k / (k.norm(dim=-1, keepdim=True) + self.eps)
-    #     q = q ** 2
-    #     k = k ** 2
-    #     q = q / (q.norm(dim=-1, keepdim=True) + self.eps)
-    #     k = k / (k.norm(dim=-1, keepdim=True) + self.eps)
-        
-    #     ones = torch.ones(Bq, Headq, Nq, 1).to(q.device)
-    #     ones1 = ones * self.ones_scale1
-    #     q = torch.cat((q, ones1), dim=-1)
-    #     k = torch.cat((k, ones1), dim=-1)
-        
-    #     # Linear matmul
-    #     trans_k = k.transpose(-1, -2)
-    #     v = F.pad(v, (0, 1), mode="constant", value=1)
-    #     kv = torch.matmul(trans_k, v)
-    #     out = torch.matmul(q, kv)
-    #     out = out[..., :-1] / (out[..., -1:] + self.eps)
-        
-    #     if valid_mask is not None:
-    #         pass
-    #     else:
-    #         # Original dwconv logic
-    #         num = int(v.shape[2] ** 0.5)
-    #         e = v.shape[1]
-    #         feature_map = rearrange(v, "b e (w h) c -> (b e) c w h", w=num, h=num)
-    #         feature_map = rearrange(self.act(self.bn(feature_map[:,:-1,:,:])), "(b e) c w h -> b e (w h) c", e=e)
-    #         out = out + feature_map
-        
-    #     # Restore original spatial structure
-    #     if valid_mask is not None:
-    #         final_out = torch.zeros(B, Headq, H*W, Cq, device=out.device, dtype=out.dtype)
-    #         for b in range(B):
-    #             n_valid = valid_indices[b].sum().item()
-    #             if n_valid > 0:
-    #                 final_out[b, :, valid_indices[b]] = out[b, :, :n_valid]
-    #         out = final_out
-        
-    #     out = torch.transpose(out, -1, -2)
-    #     out = torch.reshape(out, (B, -1, H, W))
-    #     return out
-
-    
-    # In ops.py, modify the LiteMLA.qt_attention method around line 460-470:
-
     @autocast(enabled=False)
     def qt_attention(self, qkv: torch.Tensor, valid_mask=None) -> torch.Tensor:
         B, _, H, W = list(qkv.size())
-        device = qkv.device  # Get device from input tensor
         
         if qkv.dtype == torch.float16:
             qkv = qkv.float()
@@ -581,10 +465,10 @@ class LiteMLA(nn.Module):
                 out = torch.transpose(out, -1, -2)
                 return torch.reshape(out, (B, -1, H, W))
             
-            # Create padded tensors for valid tokens only - ENSURE CORRECT DEVICE
-            q_valid = torch.zeros(B, Headq, max_valid, Cq, device=device, dtype=q.dtype)
-            k_valid = torch.zeros(B, Headq, max_valid, Cq, device=device, dtype=k.dtype)
-            v_valid = torch.zeros(B, Headq, max_valid, Cq, device=device, dtype=v.dtype)
+            # Create padded tensors for valid tokens only
+            q_valid = torch.zeros(B, Headq, max_valid, Cq, device=q.device, dtype=q.dtype)
+            k_valid = torch.zeros(B, Headq, max_valid, Cq, device=k.device, dtype=k.dtype)
+            v_valid = torch.zeros(B, Headq, max_valid, Cq, device=v.device, dtype=v.dtype)
             
             # Fill valid tokens
             for b in range(B):
@@ -598,19 +482,15 @@ class LiteMLA(nn.Module):
             q, k, v = q_valid, k_valid, v_valid
             Nq = max_valid
         
-        # Positional encoding (only applied to valid tokens now) - ENSURE CORRECT DEVICE
+        # Positional encoding (only applied to valid tokens now)
         if H != self.positional_encoding.shape[2] or W != self.positional_encoding.shape[3]:
-            absolute_pos_embed = F.interpolate(
-                self.positional_encoding.to(device), 
-                size=(H, W), 
-                mode='bicubic'
-            ).reshape(-1, Headq, Cq, H*W).transpose(-1,-2)
+            absolute_pos_embed = F.interpolate(self.positional_encoding, size=(H, W), mode='bicubic').reshape(-1, Headq, Cq, H*W).transpose(-1,-2)
         else:
-            absolute_pos_embed = self.positional_encoding.to(device).reshape(-1, Headq, Cq, H*W).transpose(-1,-2)
+            absolute_pos_embed = self.positional_encoding.reshape(-1, Headq, Cq, H*W).transpose(-1,-2)
         
         if valid_mask is not None:
             # Apply positional encoding only to valid positions
-            pos_embed_valid = torch.zeros(B, Headq, max_valid, Cq, device=device, dtype=k.dtype)
+            pos_embed_valid = torch.zeros(B, Headq, max_valid, Cq, device=k.device, dtype=k.dtype)
             for b in range(B):
                 n_valid = valid_indices[b].sum().item()
                 if n_valid > 0:
@@ -627,9 +507,8 @@ class LiteMLA(nn.Module):
         q = q / (q.norm(dim=-1, keepdim=True) + self.eps)
         k = k / (k.norm(dim=-1, keepdim=True) + self.eps)
         
-        # ENSURE CORRECT DEVICE for ones tensor
-        ones = torch.ones(Bq, Headq, Nq, 1, device=device, dtype=q.dtype)
-        ones1 = ones * self.ones_scale1.to(device)
+        ones = torch.ones(Bq, Headq, Nq, 1).to(q.device)
+        ones1 = ones * self.ones_scale1
         q = torch.cat((q, ones1), dim=-1)
         k = torch.cat((k, ones1), dim=-1)
         
@@ -652,7 +531,7 @@ class LiteMLA(nn.Module):
         
         # Restore original spatial structure
         if valid_mask is not None:
-            final_out = torch.zeros(B, Headq, H*W, Cq, device=device, dtype=out.dtype)
+            final_out = torch.zeros(B, Headq, H*W, Cq, device=out.device, dtype=out.dtype)
             for b in range(B):
                 n_valid = valid_indices[b].sum().item()
                 if n_valid > 0:
