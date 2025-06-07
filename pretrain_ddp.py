@@ -316,7 +316,7 @@ def main():
         norm_pix_loss=args.norm_pix_loss
     ).to(device)
     
-    model = DDP(model, device_ids=[args.gpu])
+    model = DDP(model, device_ids=[args.gpu], find_unused_parameters=True)
     model_without_ddp = model.module
 
     if is_main_process():
