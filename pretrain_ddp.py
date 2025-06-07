@@ -257,8 +257,8 @@ def main():
     parser.add_argument('--norm_pix_loss', default=False, action='store_true', help='Use per-patch pixel normalization')
     
     # Training parameters
-    parser.add_argument('--batch_size', default=256, type=int, help='Batch size per GPU')
-    parser.add_argument('--epochs', default=100, type=int, help='Number of epochs')
+    parser.add_argument('--batch_size', default=128, type=int, help='Batch size per GPU')
+    parser.add_argument('--epochs', default=200, type=int, help='Number of epochs')
     parser.add_argument('--warmup_epochs', default=10, type=int, help='Warmup epochs')
     parser.add_argument('--lr', default=1.5e-4, type=float, help='Learning rate')
     parser.add_argument('--min_lr', default=1e-6, type=float, help='Lower lr bound')
@@ -271,6 +271,7 @@ def main():
     parser.add_argument('--output_dir', default='./output_convmae_ddp', help='Path for output')
     parser.add_argument('--log_freq', default=50, type=int)
     parser.add_argument('--print_freq', default=10, type=int)
+    parser.add_argument('--vis_freq', default=100, type=int, help='Visualization frequency')
     parser.add_argument('--save_freq', default=10, type=int)
     parser.add_argument('--val_steps', default=100, type=int)
     parser.add_argument('--resume', default='', type=str, help='Resume from checkpoint')
