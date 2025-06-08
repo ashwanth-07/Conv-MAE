@@ -257,7 +257,7 @@ def main():
     parser.add_argument('--norm_pix_loss', default=False, action='store_true', help='Use per-patch pixel normalization')
     
     # Training parameters
-    parser.add_argument('--batch_size', default=128, type=int, help='Batch size per GPU')
+    parser.add_argument('--batch_size', default=90, type=int, help='Batch size per GPU')
     parser.add_argument('--epochs', default=200, type=int, help='Number of epochs')
     parser.add_argument('--warmup_epochs', default=10, type=int, help='Warmup epochs')
     parser.add_argument('--lr', default=1.5e-4, type=float, help='Learning rate')
