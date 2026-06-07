@@ -7,8 +7,8 @@ A comprehensive yet simple timing profiler for ConvMAE training.
 Run this to see exactly what components are taking time during training.
 
 Usage:
-    python convmae_timer.py --backbone b2 --batch_size 8 --iterations 20
-    
+    python profiler.py --backbone b2 --batch_size 8 --iterations 20
+
 Output:
     - Console timing breakdown
     - JSON results file
@@ -83,7 +83,15 @@ class SimpleTimer:
         self.timings.clear()
 
 class ConvMAETimedModel(nn.Module):
-    """ConvMAE model wrapper with detailed timing"""
+    """ConvMAE model wrapper with detailed timing.
+
+    The detailed forward pass mirrors ``ConvMAEPretrainer.forward`` and
+    ``ConvMAEDecoder.forward`` exactly, but wraps each logical stage in a timer
+    so per-component latency can be measured. It deliberately reuses the real
+    model submodules (``proj_e1``..``proj_e4``, ``multi_scale_fusion``,
+    ``mask_token``, ``decoder_blocks``, ``forward_loss``) rather than
+    re-implementing the math, so the timings reflect the actual model.
+    """
     
     def __init__(self, model: ConvMAEPretrainer, timer: SimpleTimer):
         super().__init__()
@@ -95,17 +103,19 @@ class ConvMAETimedModel(nn.Module):
         
         if not detailed:
             return self.model(images)
+
+        decoder = self.model.decoder
         
         with self.timer.time('0_total_forward'):
             # Time backbone execution
             with self.timer.time('1_backbone_total'):
-                # Time individual backbone stages
+                # Time mask generation
                 with self.timer.time('1a_mask_generation'):
-                    mask = self.model.backbone.generate_mask(images) if self.model.backbone.mask_ratio else None
+                    mask = (self.model.backbone.generate_mask(images)
+                            if self.model.backbone.mask_ratio else None)
                 
                 # Execute backbone with stage-level timing
-                backbone_output = {}
-                backbone_output["input"] = images
+                backbone_output = {"input": images}
                 
                 # Stage 0 (input stem)
                 with self.timer.time('1b_backbone_stage0'):
@@ -120,74 +130,85 @@ class ConvMAETimedModel(nn.Module):
                 
                 backbone_output["stage_final"] = x
             
-            # Time feature extraction
+            # Time feature extraction. The decoder consumes the four
+            # multi-scale maps from stages 1-4 (H/4, H/8, H/16, H/32).
             with self.timer.time('2_feature_extraction'):
                 multi_scale_features = [
-                    backbone_output["stage0"],  # H/2
                     backbone_output["stage1"],  # H/4
                     backbone_output["stage2"],  # H/8
                     backbone_output["stage3"],  # H/16
                     backbone_output["stage4"],  # H/32
                 ]
             
-            # Time decoder components
+            # Time decoder components (mirrors ConvMAEDecoder.forward)
             with self.timer.time('3_decoder_total'):
-                # Time decoder forward pass
+                B = multi_scale_features[0].shape[0]
+                # Reconstruction grid is defined by the H/16 feature map
+                _, _, H16, W16 = multi_scale_features[2].shape
+                
+                # Resize mask to the decoder grid if needed
+                mask_grid = mask
+                if mask_grid.shape != (B, 1, H16, W16):
+                    mask_grid = F.interpolate(mask_grid, size=(H16, W16), mode='nearest')
+                
                 with self.timer.time('3a_decoder_projection'):
-                    # Project each stage to decoder resolution
-                    projected_features = []
-                    for feat, proj in zip(multi_scale_features, self.model.decoder.stage_projections):
-                        proj_feat = proj(feat)
-                        proj_feat = proj_feat.flatten(2).transpose(1, 2)
-                        proj_feat = self.model.decoder.feature_norm(proj_feat)
-                        projected_features.append(proj_feat)
+                    # Project each stage to decoder_dim and a common H/16 grid
+                    feat1 = decoder.proj_e1(multi_scale_features[0])
+                    feat2 = decoder.proj_e2(multi_scale_features[1])
+                    feat3 = decoder.proj_e3(multi_scale_features[2])
+                    feat4_coarse = decoder.proj_e4(multi_scale_features[3])
+                    feat4 = F.interpolate(
+                        feat4_coarse, size=(H16, W16),
+                        mode='bilinear', align_corners=False
+                    )
+
+                    def flatten_and_norm(t):
+                        t_flat = t.flatten(2).transpose(1, 2)
+                        return decoder.feature_norm(t_flat)
+
+                    p1 = flatten_and_norm(feat1)
+                    p2 = flatten_and_norm(feat2)
+                    p3 = flatten_and_norm(feat3)
+                    p4 = flatten_and_norm(feat4)
                 
                 with self.timer.time('3b_decoder_fusion'):
                     # Fuse multi-scale features
-                    fused = torch.cat(projected_features, dim=-1)
-                    fused = self.model.decoder.multi_scale_fusion(fused)
+                    concatenated = torch.cat([p1, p2, p3, p4], dim=-1)
+                    fused = decoder.multi_scale_fusion(concatenated)
                 
                 with self.timer.time('3c_decoder_masking'):
-                    # Prepare decoder tokens with masking
-                    _, _, H32, W32 = multi_scale_features[-1].shape
-                    if mask.shape[-2:] != (H32, W32):
-                        mask_resized = F.interpolate(mask.float(), size=(H32, W32), mode='nearest')
-                    else:
-                        mask_resized = mask.float()
-                    mask_flat = mask_resized.flatten(2).transpose(1, 2).squeeze(-1)
-                    
-                    B = fused.shape[0]
-                    decoder_tokens = torch.zeros(B, H32 * W32, self.model.decoder.decoder_dim, device=fused.device)
+                    # Prepare decoder tokens, replacing masked positions with
+                    # the learned mask token
+                    mask_flat = mask_grid.flatten(2).transpose(1, 2).squeeze(-1)
+                    decoder_tokens = torch.zeros_like(fused)
                     for b in range(B):
                         vis_idx = mask_flat[b].bool()
                         decoder_tokens[b, vis_idx] = fused[b, vis_idx]
                         masked_idx = ~vis_idx
                         if masked_idx.sum() > 0:
-                            decoder_tokens[b, masked_idx] = self.model.decoder.mask_token.expand(masked_idx.sum(), self.model.decoder.decoder_dim)
+                            decoder_tokens[b, masked_idx] = decoder.mask_token.expand(
+                                masked_idx.sum(), decoder.decoder_dim
+                            )
                 
                 with self.timer.time('3d_decoder_pos_embed'):
                     # Add positional embedding
-                    self.model.decoder._init_pos_embed(H32, W32)
-                    decoder_tokens = self.model.decoder.pos_embed(decoder_tokens)
+                    decoder._init_pos_embed(H16, W16)
+                    decoder_tokens = decoder.pos_embed(decoder_tokens)
                 
                 with self.timer.time('3e_decoder_transformer'):
                     # Run through transformer blocks
-                    for blk in self.model.decoder.decoder_blocks:
-                        decoder_tokens = blk(decoder_tokens)
+                    x_dec = decoder_tokens
+                    for blk in decoder.decoder_blocks:
+                        x_dec = blk(x_dec)
                 
                 with self.timer.time('3f_decoder_prediction'):
-                    # Final prediction
-                    decoder_tokens = self.model.decoder.decoder_norm(decoder_tokens)
-                    pred = self.model.decoder.decoder_pred(decoder_tokens)
-                    
-                    # Reshape to image
-                    pred = pred.view(B, H32, W32, self.model.decoder.patch_size, self.model.decoder.patch_size, self.model.decoder.in_channels)
-                    pred = pred.permute(0, 5, 1, 3, 2, 4)
-                    pred = pred.reshape(B, self.model.decoder.in_channels, H32 * self.model.decoder.patch_size, W32 * self.model.decoder.patch_size)
+                    # Final per-patch pixel prediction: [N, L, patch_size**2 * 3]
+                    x_dec = decoder.decoder_norm(x_dec)
+                    pred = decoder.decoder_pred(x_dec)
             
-            # Time loss computation
+            # Time loss computation (uses the model's own loss + norm setting)
             with self.timer.time('4_loss_computation'):
-                loss = self.model.decoder.forward_loss(images, pred, mask)
+                loss = decoder.forward_loss(images, pred, mask, self.model.norm_pix_loss)
         
         return pred, loss, mask
 
@@ -249,7 +270,7 @@ def run_timing_analysis(
         mask_ratio=0.75,
         decoder_dim=512,
         decoder_depth=8,
-        patch_size=32
+        patch_size=16
     ).to(device)
     
     # Count parameters
