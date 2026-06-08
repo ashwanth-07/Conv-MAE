@@ -84,13 +84,6 @@ class SimpleTimer:
 
 class ConvMAETimedModel(nn.Module):
     """ConvMAE model wrapper with detailed timing.
-
-    The detailed forward pass mirrors ``ConvMAEPretrainer.forward`` and
-    ``ConvMAEDecoder.forward`` exactly, but wraps each logical stage in a timer
-    so per-component latency can be measured. It deliberately reuses the real
-    model submodules (``proj_e1``..``proj_e4``, ``multi_scale_fusion``,
-    ``mask_token``, ``decoder_blocks``, ``forward_loss``) rather than
-    re-implementing the math, so the timings reflect the actual model.
     """
     
     def __init__(self, model: ConvMAEPretrainer, timer: SimpleTimer):
